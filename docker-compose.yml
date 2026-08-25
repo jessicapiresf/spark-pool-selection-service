@@ -1,0 +1,45 @@
+# Quem so quiser ver funcionando roda `docker compose up`, sem precisar de Python na
+# maquina. Quem vai desenvolver usa `make dev`, que e mais rapido porque nao reconstroi
+# imagem a cada mudanca.
+
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,dynamodb,sqs
+      DEBUG: "0"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  seed:
+    build: .
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment: &aws_env
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+      AWS_DEFAULT_REGION: us-east-1
+      SNAPSHOT_BUCKET: pool-selection-local
+      COUNTERS_TABLE: pool-selection-counters
+    command: ["python", "tools/seed_local.py"]
+
+  api:
+    build: .
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *aws_env
+      FALLBACK_POOLS: pool-r6.xlarge-us-east-1a,pool-c6.xlarge-us-east-1a
+    command:
+      ["uvicorn", "pool_selection.entrypoints.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

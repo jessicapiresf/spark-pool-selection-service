@@ -1,0 +1,114 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.5.11"
+  AWS_REGION: us-east-1
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  staging:
+    name: Staging
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - run: make package
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Apply
+        run: |
+          terraform -chdir=infra init -backend-config=backends/staging.hcl -input=false
+          terraform -chdir=infra apply -var-file=envs/staging.tfvars -input=false -auto-approve
+
+      # Chamar o endpoint de verdade e o que separa "o Terraform aplicou" de "o servico
+      # funciona". Roda contra o ambiente real, com credencial SigV4.
+      - name: Fumaca contra o ambiente real
+        run: |
+          URL=$(terraform -chdir=infra output -raw api_url)
+          uv sync --all-extras --frozen
+          uv run python scripts/smoke.py "$URL"
+
+  producao:
+    name: Producao
+    runs-on: ubuntu-latest
+    needs: staging
+    # O ambiente exige aprovacao manual nas configuracoes do repositorio. O servico esta
+    # no caminho de submissao de job, entao um deploy ruim trava pipeline de gente.
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - run: make package
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Apply
+        run: |
+          terraform -chdir=infra init -backend-config=backends/production.hcl -input=false
+          terraform -chdir=infra apply -var-file=envs/production.tfvars -input=false -auto-approve
+
+      # 10% do trafego primeiro, com rollback automatico por alarme de erro. Um deploy ruim
+      # nao pode virar incidente enquanto alguem percebe.
+      - name: Shift gradual do alias
+        run: |
+          FUNCTION=pool-selection-api-production
+          VERSION=$(aws lambda publish-version --function-name "$FUNCTION" --query Version --output text)
+          CURRENT=$(aws lambda get-alias --function-name "$FUNCTION" --name live \
+            --query FunctionVersion --output text)
+
+          aws lambda update-alias --function-name "$FUNCTION" --name live \
+            --function-version "$CURRENT" \
+            --routing-config "AdditionalVersionWeights={$VERSION=0.1}"
+
+          echo "10% em $VERSION, observando alarmes por 5 minutos"
+          sleep 300
+
+          ALARM=$(aws cloudwatch describe-alarms \
+            --alarm-names pool-selection-api-com-erro-production \
+            --query 'MetricAlarms[0].StateValue' --output text)
+          if [ "$ALARM" = "ALARM" ]; then
+            echo "alarme disparou: revertendo para $CURRENT"
+            aws lambda update-alias --function-name "$FUNCTION" --name live \
+              --function-version "$CURRENT" --routing-config '{}'
+            exit 1
+          fi
+
+          aws lambda update-alias --function-name "$FUNCTION" --name live \
+            --function-version "$VERSION" --routing-config '{}'
+          echo "100% em $VERSION"
