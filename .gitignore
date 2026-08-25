@@ -1,0 +1,6 @@
+# 1. ENVIRONMENTS 
+.env
+.env.*
+
+# 2. 
+plugins/*
