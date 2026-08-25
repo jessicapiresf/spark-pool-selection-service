@@ -1,6 +1,9 @@
-# 1. ENVIRONMENTS 
+# 1. ENVIRONMENTS
 .env
 .env.*
 
-# 2. 
+# 2. PLUGINS
 plugins/*
+
+# 3. FERRAMENTAS LOCAIS
+.claude/
