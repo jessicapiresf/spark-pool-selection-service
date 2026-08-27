@@ -64,7 +64,7 @@ jobs:
       - run: |
           mkdir -p dist
           uv export --frozen --all-extras --no-emit-project -o dist/requirements-audit.txt
-          uv run pip-audit --strict -r dist/requirements-audit.txt
+          uv run pip-audit --strict --disable-pip -r dist/requirements-audit.txt
 
   pacote:
     name: Build do artefato

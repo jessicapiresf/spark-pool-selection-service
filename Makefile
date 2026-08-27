@@ -78,7 +78,7 @@ package:  ## Monta o zip de deploy com as dependencias de producao
 	rm -rf dist/build dist/pool_selection.zip
 	mkdir -p dist/build
 	$(UV) export --frozen --no-dev --no-emit-project -o dist/requirements.txt
-	$(UV) pip install --python-platform aarch64-manylinux2014 --python-version 3.13 \
+	$(UV) pip install --python-platform aarch64-manylinux_2_17 --python-version 3.13 \
 		--target dist/build --no-deps --requirement dist/requirements.txt
 	cp -r src/pool_selection dist/build/
 	# O runtime do Lambda ja traz boto3 e botocore, e botocore sozinho e 24 MB de um
@@ -109,7 +109,7 @@ typecheck:  ## Tipagem estrita no dominio
 audit:  ## Vulnerabilidade conhecida nas dependencias
 	@mkdir -p dist
 	$(UV) export --frozen --all-extras --no-emit-project -o dist/requirements-audit.txt
-	$(RUN) pip-audit --strict -r dist/requirements-audit.txt
+	$(RUN) pip-audit --strict --disable-pip -r dist/requirements-audit.txt
 
 check: lint typecheck test audit  ## Tudo que o CI roda
 
