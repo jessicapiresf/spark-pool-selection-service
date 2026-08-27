@@ -110,6 +110,8 @@ jobs:
     permissions:
       contents: read
       id-token: write # OIDC, em vez de chave estatica no repositorio
+    env:
+      AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -131,14 +133,14 @@ jobs:
 
       # O plan precisa de credencial, entao so roda quando o secret estiver configurado no repositorio.
       - name: Credenciais por OIDC
-        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && secrets.AWS_PLAN_ROLE_ARN != ''
+        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && env.AWS_PLAN_ROLE_ARN != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          role-to-assume: ${{ env.AWS_PLAN_ROLE_ARN }}
           aws-region: us-east-1
 
       - name: Plan em staging
-        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && secrets.AWS_PLAN_ROLE_ARN != ''
+        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && env.AWS_PLAN_ROLE_ARN != ''
         run: |
           terraform -chdir=infra init -backend-config=backends/staging.hcl -input=false
           terraform -chdir=infra plan -var-file=envs/staging.tfvars -input=false -no-color
