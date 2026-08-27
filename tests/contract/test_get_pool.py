@@ -261,10 +261,22 @@ def test_ready_reporta_idade_do_snapshot(client: TestClient) -> None:
     assert body["snapshot_age_seconds"] >= 0
 
 
+def test_os_dois_nomes_do_endpoint_respondem_igual(client: TestClient) -> None:
+    """O enunciado cita `/get-pool` e `/get-pools`. Os dois precisam funcionar."""
+    plural = client.get("/get-pools", params={"job_id": "etl-vendas", "seed": 7})
+    singular = client.get("/get-pool", params={"job_id": "etl-vendas", "seed": 7})
+
+    assert plural.status_code == 200
+    assert singular.status_code == 200
+    assert plural.json() == singular.json()
+
+
 def test_openapi_documenta_o_endpoint(client: TestClient) -> None:
     """A documentacao do endpoint e o OpenAPI gerado, entao ele precisa estar completo."""
     schema = client.get("/openapi.json").json()
-    parametros = {p["name"] for p in schema["paths"]["/get-pool"]["get"]["parameters"]}
+    # O alias fica fora do schema de proposito, para a referencia nao sair duplicada.
+    assert "/get-pool" not in schema["paths"]
+    parametros = {p["name"] for p in schema["paths"]["/get-pools"]["get"]["parameters"]}
     assert parametros >= {
         "job_id",
         "instance_types",
@@ -276,4 +288,4 @@ def test_openapi_documenta_o_endpoint(client: TestClient) -> None:
         "strategy",
         "alternatives",
     }
-    assert set(schema["paths"]["/get-pool"]["get"]["responses"]) >= {"200", "404", "422", "503"}
+    assert set(schema["paths"]["/get-pools"]["get"]["responses"]) >= {"200", "404", "422", "503"}

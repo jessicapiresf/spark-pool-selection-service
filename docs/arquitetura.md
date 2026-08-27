@@ -2,10 +2,10 @@
 
 Uma API que responde, a qualquer hora, em qual pool de instâncias spot um job Spark tem
 mais chance de rodar até o fim. Este documento explica o desenho, o que foi escolhido e o
-que foi descartado. A rastreabilidade requisito a requisito está em
-[requisitos.md](requisitos.md).
+que foi descartado.
 
-Status: plano aprovado, implementação não iniciada.
+Status: implementado. A rastreabilidade requisito a requisito está em
+[requisitos.md](requisitos.md), e o que ficou de fora está na [seção 12](#12-limites-conhecidos).
 
 ---
 
@@ -36,15 +36,15 @@ ser rápida e barata ao mesmo tempo.
 flowchart LR
   subgraph escrita["Escrita (assíncrona)"]
     direction LR
-    S3[("S3<br/>.json, 1 evento/linha")]
-    SQS[["SQS<br/>fila + DLQ"]]
+    S3[("S3 - json, 1 evento/linha")]
+    SQS[["SQS - fila e DLQ"]]
     ING["Lambda ingestora"]
-    CNT[("DynamoDB<br/>contadores")]
-    EB{{"EventBridge<br/>a cada 60s"}}
+    CNT[("DynamoDB - contadores")]
+    EB{{"EventBridge - a cada 60s"}}
     AGG["Lambda agregadora"]
-    SNAP[("S3<br/>snapshot gzip")]
-    DBX[/"API de pools<br/>da Databricks"/]
-    SPS[/"EC2 Spot<br/>Placement Score"/]
+    SNAP[("S3 - snapshot gzip")]
+    DBX["API de pools Databricks"]
+    SPS["EC2 Spot Placement Score"]
 
     S3 -->|notifica| SQS
     SQS -->|lote| ING
@@ -60,7 +60,7 @@ flowchart LR
     direction LR
     JOB(["Job Spark"])
     FURL["Function URL"]
-    API["Lambda API<br/>snapshot em memória"]
+    API["Lambda API (snapshot em memória)"]
 
     JOB -->|GET /get-pool| FURL
     FURL --> API
@@ -200,8 +200,10 @@ score é sobre a região.
 
 O que a AWS não promete importa tanto quanto o que ela promete. O score é recomendação,
 não garantia de capacidade, e um score alto por AZ assume alocação `capacity-optimized`
-concentrada em uma AZ, que é como um pool funciona de qualquer jeito. Se a chamada falhar,
-o fator fica neutro e o serviço volta a ser reativo, sem quebrar.
+concentrada em uma AZ, que é como um pool funciona de qualquer jeito. Se a chamada falhar, a
+agregadora mantém a previsão anterior e o `age_seconds` do `az_outlook` cresce, o que
+denuncia o problema na própria resposta. Só na primeira execução, quando não há previsão
+nenhuma, o fator nasce neutro e o serviço é puramente reativo.
 
 ### De onde sai o perfil de um tipo de instância
 
@@ -246,6 +248,34 @@ inteiro no dono do job que foi cobaia, nunca distribuído, então o endpoint ace
 `min_samples` para job crítico exigir evidência e a resposta expõe de onde veio a
 recomendação.
 
+### O sorteio sozinho não segura um pico
+
+Sortear espalha, mas não sabe quanto cabe. Cada request sorteia de forma independente, e a
+fatia que um pool recebe converge para a probabilidade de ele vencer, que não olha para o
+número de vagas dele. Dois mil jobs na mesma janela ainda cabem quase todos no mesmo pool,
+e o requisito não é responder rápido, é o job **conseguir** o pool.
+
+Por isso a fatia de cada candidato tem teto, derivado da capacidade livre que a Databricks
+reporta. A comparação é contra o candidato mais folgado, não contra a soma: comparar com a
+soma apertaria todo mundo só por existirem muitos pools, quando capacidade igual significa
+exatamente que nenhum é mais frágil que o outro.
+
+| Situação | Teto | Efeito |
+|---|---|---|
+| Candidatos com folga parecida | nenhum | Idêntico ao sorteio puro. |
+| Pool com 1/3 da folga do maior | 100% | Ainda pode levar todo o tráfego. |
+| Pool com 2 vagas contra 60 | 10% | Leva 10%, e o resto escorre para o próximo melhor. |
+| Pool sem teto declarado | nenhum | Sem saber as vagas, qualquer número seria invenção. |
+
+A alocação é uma passada em ordem de score: o melhor leva o que couber no teto dele, o
+excedente vai para o seguinte. O sorteio é um número uniforme contra essa distribuição, e
+o custo continua sendo zero de I/O. `strategy=greedy` ignora o teto de propósito, porque
+quem pede resposta determinística quer o melhor pool e não uma distribuição.
+
+O que isso não resolve: se todos os candidatos estão quase cheios, todos têm folga parecida
+e ninguém é limitado. Rotear não cria capacidade, e esse caso pede pool novo. O sinal para
+perceber é o `free_slots` que vai na resposta.
+
 ### Job novo erra, e se corrige em três execuções
 
 Um job que nunca rodou não começa cego. O fator de AZ já nasce calibrado, porque veio de
@@ -282,6 +312,7 @@ A segunda é o serviço nunca devolver erro se puder evitar:
 | Nenhum snapshot | Lista estática de pools conhecidos, escolha uniforme, `degraded: true`. |
 | Filtro não casa com nada | 404 com mensagem explícita. |
 | Parâmetro inválido | 422, gerado pela validação. |
+| Token da Databricks ilegível | Segue sem a fonte de capacidade, registra o motivo no log. |
 
 O job vai ser submetido de qualquer jeito. Um palpite informado é melhor que um 503.
 
@@ -294,7 +325,10 @@ mais longo (junho de 2029) e roda em Amazon Linux 2023. Python 3.11 foi a primei
 escolha e caiu na revisão: ainda vive em Amazon Linux 2, cujo fim de vida foi em junho de
 2026, e é depreciado no Lambda em junho de 2027.
 
-`GET /get-pool`, todos os parâmetros opcionais e combináveis.
+`GET /get-pools`, todos os parâmetros opcionais e combináveis. O enunciado cita os dois
+nomes, `/get-pool` no requisito do endpoint e `/get-pools` no do ambiente local, então o
+serviço responde nos dois: `/get-pools` é o documentado e `/get-pool` é alias. Localmente
+sobe em `http://localhost:5050`.
 
 | Parâmetro | Efeito |
 |---|---|
@@ -307,6 +341,7 @@ escolha e caiu na revisão: ainda vive em Amazon Linux 2, cujo fim de vida foi e
 | `min_samples` | Exige evidência mínima. Desliga a exploração para job crítico. |
 | `strategy` | `sampling` (padrão) ou `greedy`. |
 | `alternatives` | Quantos pools de reserva retornar, padrão 2. |
+| `seed` | Semente do sorteio. Existe para teste e depuração. |
 
 ```json
 {
@@ -492,7 +527,7 @@ execução por minuto. Se o número de jobs multiplicar por cem, a arquitetura n
 
 ---
 
-## 9. O que será construído
+## 9. O que foi construído
 
 O miolo estatístico é Python puro, sem `boto3` e sem FastAPI, então roda em teste em
 milissegundos sem simular AWS. As bordas ficam finas o bastante para poucos testes de
@@ -524,12 +559,19 @@ tests/                   # unit, propriedades, integração, simulação
 | 2. API | `/get-pool` com todos os filtros, degradação, `/health`, `/ready` e OpenAPI, contra repositório em memória. |
 | 3. Ambiente local | Adapters, docker compose com LocalStack, gerador de eventos e o Makefile. |
 | 4. Pipeline | Ingestora com pré-agregação e deduplicação, agregadora incremental, as três fontes ligadas, e o teste que derruba a disponibilidade de uma AZ e verifica que a recomendação migra antes de o primeiro job morrer. |
-| 5. Produção | Terraform, GitHub Actions, alarmes, backfill do histórico e ADRs. |
+| 5. Produção | Terraform, GitHub Actions, alarmes e backfill do histórico. As decisões arquiteturais estão neste documento, com as alternativas descartadas em cada uma; não há um diretório de ADRs separado. |
 | 6. Depois | Penalização por concentração. Fora do escopo mínimo, precisa de tráfego real para calibrar. |
 
-Ambiente de desenvolvimento: `make dev` faz o `uv sync` criar o ambiente virtual, sobe o
-LocalStack, popula eventos sintéticos e liga a API com reload. Quem só quiser ver
-funcionando tem `docker compose up`, sem precisar de Python na máquina.
+Ambiente de desenvolvimento: `make dev` faz o `uv sync` criar o ambiente virtual, roda o
+pipeline de verdade em memória sobre eventos sintéticos, grava o snapshot num arquivo e
+liga a API com reload em `http://localhost:5050`. Sem Docker: o único pré-requisito é o
+`uv`, que instala o próprio Python.
+
+O que muda no modo local é de onde se lê e onde se grava, nunca o que roda no meio. A
+ingestora e a agregadora são as mesmas, e o arquivo gerado é byte a byte o que a produção
+publicaria. `make dev-aws` roda o mesmo fluxo contra o LocalStack, para exercitar os
+adapters de AWS, e `docker compose up` sobe tudo em container para quem não quer nem o
+`uv` na máquina.
 
 ---
 
@@ -578,20 +620,25 @@ API por métrica.
 | Latência p50 e p99 | Verificar se o caminho sem I/O está mesmo sem I/O. |
 | Idade do snapshot | Detectar agregadora parada antes de a recomendação apodrecer. |
 | Taxa de resposta degradada | Saber quando o serviço está no fallback. |
-| Distribuição dos pools recomendados | Detectar efeito manada. |
-| Origem da recomendação | Quanto do tráfego está sendo atendido por palpite. |
+| Distribuição dos pools recomendados | Detectar efeito manada. Sai como dimensão `Pool`, então o painel quebra por pool em vez de mostrar só o total. |
+| Origem da recomendação | Quanto do tráfego está sendo atendido por palpite. Vai como propriedade `source` no log estruturado. |
+| Agregadora sem invocação | Agregadora parada não gera erro, só para de rodar. É o único alarme que não depende de tráfego. |
 | Divergência entre placement score e falha observada | AZ com score alto onde jobs continuam morrendo significa que o peso da previsão está errado, ou que a capacidade alvo perguntada não representa o uso real. É o alarme que valida o sinal preditivo. |
 
 ---
 
 ## 12. Limites conhecidos
 
-Efeito manada em pico é a limitação mais séria, e é de modelo, não de infra. Quando a
-capacidade está apertada e restam poucos pools bons, o sorteio concentra, e mandar mil
-jobs para a AZ que estava saudável justamente porque ninguém a usava é causar o problema
-que o serviço evita. A correção é penalizar pool já recomendado muitas vezes nos últimos
-minutos, com o contador escrito de forma assíncrona para não bloquear a resposta. Fica
-para depois, porque precisa de tráfego real para calibrar.
+Efeito manada em pico é a limitação mais séria, e é de modelo, não de infra. O teto por
+capacidade da [seção 3](#o-sorteio-sozinho-não-segura-um-pico) cobre a parte que dá para
+cobrir sem estado compartilhado: nenhum pool recebe fatia maior do que a folga dele
+comporta. O que ele não cobre é a demanda real, porque a API não sabe quantos jobs estão
+chegando. O teto limita a proporção, não o número absoluto.
+
+Fechar isso exige contar quantas recomendações cada pool recebeu nos últimos minutos, o
+que significa escrita no caminho de request, ainda que assíncrona. Fica para quando houver
+tráfego real para calibrar, e o sinal que diz se é necessário é a distribuição por pool no
+painel.
 
 As outras:
 

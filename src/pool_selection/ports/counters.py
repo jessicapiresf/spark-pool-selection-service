@@ -54,10 +54,21 @@ class CounterStore(Protocol):
         """Le tudo de um minuto em uma consulta so."""
         ...
 
-    def claim(self, identity: str) -> bool:
-        """Reivindica um objeto do S3. `False` se ja foi processado antes.
+    def processed(self, identities: Iterable[str]) -> set[str]:
+        """Quais desses objetos ja foram contados antes.
 
-        E o que impede um lote reentregue de contar a mesma falha de novo e afundar um
-        pool que estava bem.
+        Consulta sem efeito colateral. E o que impede um lote reentregue de contar a mesma
+        falha de novo e afundar um pool que estava bem.
+        """
+        ...
+
+    def mark_processed(self, identities: Iterable[str]) -> None:
+        """Marca os objetos como contados.
+
+        Chamado **depois** de os contadores terem sido gravados, nunca antes. Marcar antes
+        parece mais seguro e nao e: se a funcao morre entre a marca e a escrita, a
+        reentrega encontra o objeto marcado, pula, e aquele evento some para sempre. Na
+        ordem certa, o mesmo acidente causa contagem dobrada, que decai junto com o resto
+        e nao abre buraco no historico.
         """
         ...

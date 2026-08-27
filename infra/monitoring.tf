@@ -15,7 +15,10 @@ resource "aws_cloudwatch_metric_alarm" "snapshot_age" {
   statistic           = "Maximum"
   namespace           = "PoolSelection"
   metric_name         = "SnapshotAgeSeconds"
-  treat_missing_data  = "breaching"
+  # A metrica sai a cada request da API. Numa madrugada sem job nenhum ela some, e
+  # "breaching" transformaria silencio em pagina falsa. Agregadora parada e coberta pelo
+  # alarme de invocacao abaixo, que nao depende de trafego.
+  treat_missing_data = "notBreaching"
 
   alarm_description = "Snapshot com mais de 5 minutos: a agregadora parou ou esta falhando."
   alarm_actions     = local.alarm_actions
@@ -38,6 +41,28 @@ resource "aws_cloudwatch_metric_alarm" "aggregator_failures" {
   treat_missing_data  = "notBreaching"
 
   alarm_actions = local.alarm_actions
+
+  dimensions = {
+    FunctionName = aws_lambda_function.aggregator.function_name
+  }
+}
+
+# Agregadora que para de ser invocada nao gera erro nenhum: ela simplesmente nao roda, e o
+# snapshot envelhece sem ninguem perceber. Este e o alarme que nao depende de trafego.
+resource "aws_cloudwatch_metric_alarm" "aggregator_stopped" {
+  alarm_name          = "pool-selection-agregadora-parada-${var.environment}"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 3
+  period              = 300
+  statistic           = "Sum"
+  namespace           = "AWS/Lambda"
+  metric_name         = "Invocations"
+  treat_missing_data  = "breaching"
+
+  alarm_description = "Menos de 3 execucoes em 5 minutos: o agendador parou de disparar."
+  alarm_actions     = local.alarm_actions
+  ok_actions        = local.alarm_actions
 
   dimensions = {
     FunctionName = aws_lambda_function.aggregator.function_name
@@ -114,6 +139,10 @@ resource "aws_cloudwatch_metric_alarm" "degraded_rate" {
   treat_missing_data  = "notBreaching"
 
   alarm_actions = local.alarm_actions
+
+  dimensions = {
+    Component = "Api"
+  }
 }
 
 resource "aws_cloudwatch_dashboard" "main" {
@@ -155,9 +184,15 @@ resource "aws_cloudwatch_dashboard" "main" {
       {
         type = "metric", width = 12, height = 6, x = 12, y = 6
         properties = {
-          title   = "Distribuicao dos pools recomendados (efeito manada)"
-          region  = var.region
-          metrics = [["PoolSelection", "Recommendations", "Component", "Api", { stat = "Sum" }]]
+          title  = "Distribuicao dos pools recomendados (efeito manada)"
+          region = var.region
+          view   = "timeSeries"
+          # A quebra por pool sai do conjunto de dimensoes [Component, Pool] emitido pela
+          # API. Com um pool concentrando a maior parte das recomendacoes, a linha dele
+          # descola das outras, que e o sintoma a procurar.
+          metrics = [
+            [{ expression = "SEARCH('{PoolSelection,Component,Pool} Component=\"Api\" MetricName=\"Recommendations\"', 'Sum', 60)", id = "manada" }],
+          ]
         }
       },
     ]

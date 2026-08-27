@@ -38,17 +38,30 @@ def emit_metrics(
     metrics: Mapping[str, float],
     dimensions: Mapping[str, str] | None = None,
     unit: str = "Count",
+    dimension_sets: list[list[str]] | None = None,
     **context: Any,
 ) -> None:
-    """Uma linha de log que o CloudWatch le como metrica."""
+    """Uma linha de log que o CloudWatch le como metrica.
+
+    `dimension_sets` permite publicar a mesma metrica em mais de um recorte. O painel de
+    efeito manada precisa do total e da quebra por pool, e sem os dois conjuntos so o
+    total existiria. Cada nome citado precisa estar em `dimensions`.
+    """
     dimensions = dimensions or {}
+    if dimension_sets is None:
+        dimension_sets = [list(dimensions)] if dimensions else [[]]
+    else:
+        unknown = {name for group in dimension_sets for name in group} - set(dimensions)
+        if unknown:
+            raise ValueError(f"dimensao sem valor: {sorted(unknown)}")
+
     payload: dict[str, Any] = {
         "_aws": {
             "Timestamp": int(time.time() * 1000),
             "CloudWatchMetrics": [
                 {
                     "Namespace": NAMESPACE,
-                    "Dimensions": [list(dimensions)] if dimensions else [[]],
+                    "Dimensions": dimension_sets,
                     "Metrics": [{"Name": name, "Unit": unit} for name in metrics],
                 }
             ],

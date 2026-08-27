@@ -12,13 +12,16 @@ from collections.abc import Iterable
 from typing import Any
 
 import boto3
-from botocore.exceptions import ClientError
 
 from pool_selection.ports.counters import CounterDelta, MinuteCounters, Scope
 
 MINUTE_PARTITION = "MIN#{minute}"
-CLAIM_PARTITION = "OBJ#{identity}"
+CLAIM_PREFIX = "OBJ#"
+CLAIM_PARTITION = CLAIM_PREFIX + "{identity}"
 CLAIM_SORT_KEY = "CLAIM"
+
+# Limite do proprio BatchGetItem.
+BATCH_GET_LIMIT = 100
 
 # Os contadores sao delta consumido uma vez: o estado com decaimento mora no snapshot.
 # Dois dias cobrem uma parada longa da agregadora com folga.
@@ -75,19 +78,33 @@ class DynamoDBCounterStore:
                     jobs[(job_id, instance_type)] = counts
         return MinuteCounters(minute=minute, pools=pools, jobs=jobs)
 
-    def claim(self, identity: str) -> bool:
-        try:
+    def processed(self, identities: Iterable[str]) -> set[str]:
+        """Consulta em lote. O BatchGetItem aceita cem chaves por chamada."""
+        wanted = list(dict.fromkeys(identities))
+        found: set[str] = set()
+        for start in range(0, len(wanted), BATCH_GET_LIMIT):
+            page = wanted[start : start + BATCH_GET_LIMIT]
+            keys = [
+                {"pk": {"S": CLAIM_PARTITION.format(identity=item)}, "sk": {"S": CLAIM_SORT_KEY}}
+                for item in page
+            ]
+            pending: dict[str, Any] = {self._table: {"Keys": keys}}
+            while pending:
+                response = self._client.batch_get_item(RequestItems=pending)
+                for item in response.get("Responses", {}).get(self._table, ()):
+                    found.add(item["pk"]["S"].removeprefix(CLAIM_PREFIX))
+                # O DynamoDB pode devolver parte do lote e pedir para tentar o resto.
+                pending = response.get("UnprocessedKeys") or {}
+        return found
+
+    def mark_processed(self, identities: Iterable[str]) -> None:
+        expires_at = str(int(time.time()) + CLAIM_TTL_SECONDS)
+        for identity in dict.fromkeys(identities):
             self._client.put_item(
                 TableName=self._table,
                 Item={
                     "pk": {"S": CLAIM_PARTITION.format(identity=identity)},
                     "sk": {"S": CLAIM_SORT_KEY},
-                    "expires_at": {"N": str(int(time.time()) + CLAIM_TTL_SECONDS)},
+                    "expires_at": {"N": expires_at},
                 },
-                ConditionExpression="attribute_not_exists(pk)",
             )
-        except ClientError as error:
-            if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                return False
-            raise
-        return True

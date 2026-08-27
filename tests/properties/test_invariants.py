@@ -25,7 +25,14 @@ from pool_selection.domain.scoring import (
     PlacementForecast,
     SpotAvailability,
 )
-from pool_selection.domain.selection import Strategy, select
+from pool_selection.domain.selection import (
+    ScoredPool,
+    Strategy,
+    allocate,
+    capacity_caps,
+    draw,
+    select,
+)
 from pool_selection.domain.snapshot import PoolEntry, Snapshot
 from pool_selection.domain.statistics import Posterior, beta_quantile, regularized_incomplete_beta
 
@@ -270,3 +277,69 @@ def test_ajuste_de_capacidade_nunca_piora_o_pool(entry: PoolEntry, availability:
         target_capacity=entry.forecast.target_capacity if entry.forecast else 10,
     )
     assert factors.adjusted_availability(availability) >= availability - 1e-9
+
+
+@given(
+    entries=st.lists(pool_entries(), min_size=1, max_size=8, unique_by=lambda p: p.pool_id.value),
+    concentration=st.floats(0.1, 10.0),
+)
+def test_alocacao_sempre_distribui_toda_a_massa(
+    entries: list[PoolEntry], concentration: float
+) -> None:
+    """A alocacao nunca fica vazia nem perde probabilidade.
+
+    Se ficasse vazia, o sorteio estouraria. Se somasse menos que um, uma parte das
+    chamadas nao teria pool para cair. Vale para qualquer combinacao de capacidade,
+    inclusive todos lotados e todos sem teto declarado.
+    """
+    scored = [
+        ScoredPool(pool=pool, factors=Factors(Posterior(1, 1), Posterior(1, 1)), score=n / 10.0)
+        for n, pool in enumerate(entries)
+    ]
+    scored.sort(key=lambda item: (-item.score, item.pool_id))
+    allocation = allocate(scored, capacity_caps(entries, concentration))
+
+    assert allocation, "alocacao vazia deixaria o sorteio sem candidato"
+    assert sum(share for _, share in allocation) == pytest.approx(1.0)
+    assert all(share > 0.0 for _, share in allocation)
+
+
+@given(
+    entries=st.lists(pool_entries(), min_size=1, max_size=8, unique_by=lambda p: p.pool_id.value),
+    concentration=st.floats(0.1, 10.0),
+    seed=st.integers(0, 10_000),
+)
+def test_sorteio_sempre_devolve_um_candidato_da_lista(
+    entries: list[PoolEntry], concentration: float, seed: int
+) -> None:
+    scored = [
+        ScoredPool(pool=pool, factors=Factors(Posterior(1, 1), Posterior(1, 1)), score=n / 10.0)
+        for n, pool in enumerate(entries)
+    ]
+    scored.sort(key=lambda item: (-item.score, item.pool_id))
+    allocation = allocate(scored, capacity_caps(entries, concentration))
+
+    escolhido = draw(allocation, random.Random(seed))
+    assert escolhido.pool_id in {pool.pool_id.value for pool in entries}
+
+
+@given(
+    entries=st.lists(pool_entries(), min_size=2, max_size=8, unique_by=lambda p: p.pool_id.value),
+    concentration=st.floats(0.1, 10.0),
+    seed=st.integers(0, 10_000),
+)
+def test_escolhido_nunca_se_repete_nas_alternativas(
+    entries: list[PoolEntry], concentration: float, seed: int
+) -> None:
+    """Alternativa e plano B. Repetir o escolhido ali seria devolver o mesmo pool duas vezes."""
+    snapshot = Snapshot(generated_at=NOW, pools=tuple(entries))
+    selection = select(
+        snapshot,
+        entries,
+        rng=random.Random(seed),
+        alternatives=len(entries),
+        concentration=concentration,
+    )
+    ids = [alt.pool_id for alt in selection.alternatives]
+    assert selection.chosen.pool_id not in ids
+    assert len(ids) == len(set(ids))

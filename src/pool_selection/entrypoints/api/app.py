@@ -12,6 +12,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 
+from pool_selection.adapters.file_snapshots import FileSnapshotStore
 from pool_selection.adapters.s3_snapshots import S3SnapshotStore
 from pool_selection.config import Settings, settings
 from pool_selection.domain.filters import PoolFilter, candidates
@@ -32,6 +33,7 @@ from pool_selection.entrypoints.api.schemas import (
 )
 from pool_selection.entrypoints.api.snapshot_cache import NoSnapshotAvailableError, SnapshotCache
 from pool_selection.observability import configure_logging, emit_metrics
+from pool_selection.ports.snapshots import SnapshotStore
 
 DESCRIPTION = """
 Indica em qual pool de instancias spot um Spark job tem mais chance de rodar ate o fim.
@@ -45,8 +47,14 @@ _cache: SnapshotCache | None = None
 
 
 def build_cache(config: Settings) -> SnapshotCache:
+    """`SNAPSHOT_PATH` liga o modo local, sem AWS. Em producao ele nao existe e vale o S3."""
+    store: SnapshotStore = (
+        FileSnapshotStore(config.snapshot_path)
+        if config.snapshot_path
+        else S3SnapshotStore(config.snapshot_bucket, config.snapshot_key)
+    )
     return SnapshotCache(
-        store=S3SnapshotStore(config.snapshot_bucket, config.snapshot_key),
+        store=store,
         ttl_seconds=config.snapshot_ttl_seconds,
         stale_after_seconds=config.stale_after_seconds,
         fallback_pools=config.fallback_pools,
@@ -75,8 +83,12 @@ def create_app() -> FastAPI:
         docs_url="/docs",
     )
 
+    # O enunciado cita os dois nomes: `/get-pool` no requisito do endpoint e `/get-pools`
+    # no do ambiente local. Servir os dois custa uma linha e tira a ambiguidade de quem
+    # chama. `/get-pools` e o documentado; o outro fica como alias fora do OpenAPI para a
+    # referencia nao aparecer duplicada.
     @app.get(
-        "/get-pool",
+        "/get-pools",
         response_model=PoolRecommendation,
         responses={
             404: {"model": ErrorDetail, "description": "Nenhum pool atende aos filtros."},
@@ -84,6 +96,7 @@ def create_app() -> FastAPI:
         },
         summary="Devolve o pool com maior chance de o job terminar",
     )
+    @app.get("/get-pool", response_model=PoolRecommendation, include_in_schema=False)
     def get_pool(
         response: Response,
         cache: Annotated[SnapshotCache, Depends(get_cache)],
@@ -116,13 +129,19 @@ def create_app() -> FastAPI:
             StrategyName, Query(description="`greedy` para resposta deterministica.")
         ] = "sampling",
         alternatives: Annotated[
-            int, Query(ge=0, le=10, description="Quantos pools de reserva retornar.")
-        ] = 2,
+            int | None,
+            Query(
+                ge=0,
+                le=10,
+                description="Quantos pools de reserva retornar. Sem valor, usa o padrao.",
+            ),
+        ] = None,
         seed: Annotated[
             int | None, Query(description="Semente do sorteio. Existe para teste e depuracao.")
         ] = None,
     ) -> PoolRecommendation:
         now = datetime.now(UTC)
+        config = settings()
         try:
             view = cache.get(now)
         except NoSnapshotAvailableError as error:
@@ -144,18 +163,28 @@ def create_app() -> FastAPI:
                 job_id=job_id,
                 strategy=Strategy(strategy),
                 rng=random.Random(seed),
-                alternatives=alternatives,
+                alternatives=(
+                    config.default_alternatives if alternatives is None else alternatives
+                ),
+                concentration=config.capacity_concentration,
             )
         except NoCandidatesError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error
 
         if view.stale or view.degraded:
             response.headers["Cache-Control"] = "no-store"
+        # `Pool` entra como conjunto de dimensoes proprio: sem isso nao da para ver a
+        # distribuicao das recomendacoes, que e o sinal de efeito manada.
         emit_metrics(
-            {"Recommendations": 1, "SnapshotAgeSeconds": view.age_seconds},
-            dimensions={"Component": "Api"},
-            pool_id=selection.chosen.pool_id,
-            degraded=view.degraded,
+            {
+                "Recommendations": 1,
+                "SnapshotAgeSeconds": view.age_seconds,
+                "DegradedResponses": 1 if view.degraded else 0,
+                "StaleResponses": 1 if view.stale else 0,
+            },
+            dimensions={"Component": "Api", "Pool": selection.chosen.pool_id},
+            dimension_sets=[["Component"], ["Component", "Pool"]],
+            source=_evidence_source(view.snapshot, selection.chosen, job_id),
         )
         return _render(selection.chosen, selection.alternatives, view.snapshot, view, job_id, now)
 
@@ -174,6 +203,24 @@ def create_app() -> FastAPI:
     return app
 
 
+def _evidence_source(snapshot: Snapshot, chosen: ScoredPool, job_id: str | None) -> str:
+    """De onde veio a recomendacao. Vai na resposta e tambem em metrica.
+
+    Saber quanto do trafego esta sendo atendido por palpite e o que diz se o modelo esta
+    aprendendo ou so chutando.
+    """
+    pool = chosen.pool
+    job_evidence = (
+        snapshot.job_fit.get(job_id, {}).get(pool.pool_id.instance_type.value) if job_id else None
+    )
+    if job_evidence is not None and job_evidence.trials > 0:
+        return "job_history"
+    profile_evidence = snapshot.profile_fit.get(pool.profile.value)
+    if profile_evidence is not None and profile_evidence.trials > 0:
+        return "profile_prior"
+    return "none"
+
+
 def _render(
     chosen: ScoredPool,
     alternatives: tuple[ScoredPool, ...],
@@ -186,13 +233,7 @@ def _render(
     job_evidence = (
         snapshot.job_fit.get(job_id, {}).get(pool.pool_id.instance_type.value) if job_id else None
     )
-    profile_evidence = snapshot.profile_fit.get(pool.profile.value)
-    if job_evidence is not None and job_evidence.trials > 0:
-        source = "job_history"
-    elif profile_evidence is not None and profile_evidence.trials > 0:
-        source = "profile_prior"
-    else:
-        source = "none"
+    source = _evidence_source(snapshot, chosen, job_id)
 
     capacity = None
     if pool.capacity is not None:

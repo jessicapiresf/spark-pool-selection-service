@@ -11,7 +11,7 @@ import http from 'k6/http';
 import { check } from 'k6';
 import { Rate } from 'k6/metrics';
 
-const BASE_URL = __ENV.BASE_URL || 'http://localhost:8000';
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:5050';
 
 const degraded = new Rate('respostas_degradadas');
 const stale = new Rate('respostas_com_snapshot_velho');
@@ -55,7 +55,7 @@ const FILTROS = [
 
 export default function () {
   const filtro = FILTROS[Math.floor(Math.random() * FILTROS.length)];
-  const res = http.get(`${BASE_URL}/get-pool${filtro}`, { tags: { name: 'get-pool' } });
+  const res = http.get(`${BASE_URL}/get-pools${filtro}`, { tags: { name: 'get-pools' } });
 
   const ok = check(res, {
     'status 200': (r) => r.status === 200,

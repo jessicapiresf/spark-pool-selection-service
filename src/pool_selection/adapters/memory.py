@@ -47,11 +47,11 @@ class InMemoryCounterStore:
             },
         )
 
-    def claim(self, identity: str) -> bool:
-        if identity in self._claimed:
-            return False
-        self._claimed.add(identity)
-        return True
+    def processed(self, identities: Iterable[str]) -> set[str]:
+        return {identity for identity in identities if identity in self._claimed}
+
+    def mark_processed(self, identities: Iterable[str]) -> None:
+        self._claimed.update(identities)
 
 
 class InMemorySnapshotStore:

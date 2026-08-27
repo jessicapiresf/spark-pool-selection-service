@@ -30,16 +30,16 @@ def main(base_url: str) -> int:
     assert status == 200, f"/health devolveu {status}: {body}"
     print("health ok")
 
-    status, body = signed_get(base_url, "/get-pool?job_id=smoke-test&alternatives=1")
+    status, body = signed_get(base_url, "/get-pools?job_id=smoke-test&alternatives=1")
     if status == 503:
         print("sem snapshot ainda: a agregadora roda a cada minuto, tente de novo depois")
         return 1
 
-    assert status == 200, f"/get-pool devolveu {status}: {body}"
+    assert status == 200, f"/get-pools devolveu {status}: {body}"
     assert body["pool_id"].startswith("pool-"), body
     assert 0.0 <= body["score"] <= 1.0, body
     print(
-        f"get-pool ok: {body['pool_id']} score={body['score']} "
+        f"get-pools ok: {body['pool_id']} score={body['score']} "
         f"fonte={body['evidence']['source']} degradado={body['degraded']}"
     )
 

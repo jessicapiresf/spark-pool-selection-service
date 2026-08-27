@@ -13,24 +13,33 @@ histórico de término dos jobs, a capacidade atual dos pools e a previsão de s
 make dev
 ```
 
-Um comando. Cria o ambiente virtual isolado com `uv`, sobe o LocalStack, gera eventos
-sintéticos, publica um snapshot e liga a API em <http://localhost:8000>, com a
-documentação interativa em <http://localhost:8000/docs>.
+Um comando, sem Docker. Cria o ambiente virtual isolado com `uv`, gera eventos sintéticos,
+roda o pipeline de verdade sobre eles, publica um snapshot e liga a API em
+<http://localhost:5050/get-pools>, com a documentação interativa em
+<http://localhost:5050/docs>.
 
-Quem só quiser ver funcionando, sem Python na máquina:
+O único pré-requisito é o [uv](https://docs.astral.sh/uv/). Ele instala o próprio Python
+3.13, então não importa qual versão está na máquina.
+
+Quem preferir container, ou não quiser nem o `uv`:
 
 ```bash
 docker compose up
 ```
 
-O único pré-requisito é o [uv](https://docs.astral.sh/uv/). Ele instala o próprio Python
-3.13, então não importa qual versão está na máquina.
+E quem quiser exercitar os adapters de AWS contra o LocalStack, o que precisa de Docker:
+
+```bash
+make dev-aws
+```
 
 ## O endpoint
 
 ```bash
-curl 'localhost:8000/get-pool?job_id=etl-vendas&profile=memory'
+curl 'localhost:5050/get-pools?job_id=etl-vendas&profile=memory'
 ```
+
+O enunciado cita os dois nomes, então `/get-pool` também responde, como alias.
 
 ```json
 {
@@ -50,7 +59,7 @@ curl 'localhost:8000/get-pool?job_id=etl-vendas&profile=memory'
 
 Todos os parâmetros são opcionais e combináveis: `job_id`, `instance_types`, `family`,
 `profile`, `availability_zones`, `exclude_pools`, `min_samples`, `strategy`,
-`alternatives`. A referência completa está no OpenAPI em `/docs` e no
+`alternatives`, `seed`. A referência completa está no OpenAPI em `/docs` e no
 [contrato](docs/arquitetura.md#5-contrato-do-endpoint).
 
 ## Como funciona
@@ -60,9 +69,14 @@ por minuto, e uma API que só consulta o resultado, já em memória. Na maior pa
 chamadas nenhuma requisição de rede acontece.
 
 O score de cada pool combina duas faixas de incerteza, e a escolha é um sorteio dentro
-delas, não o máximo. Isso resolve três problemas de uma vez: um pico de jobs não vai todo
-para o mesmo pool, um pool que parou de ser recomendado ainda gera evidência de vez em
-quando, e um pool com 1 sucesso em 1 tentativa não passa na frente de um com 200 em 210.
+delas, não o máximo. Isso resolve dois problemas: um pool que parou de ser recomendado
+ainda gera evidência de vez em quando, e um pool com 1 sucesso em 1 tentativa não passa na
+frente de um com 200 em 210.
+
+Sortear sozinho não segura um pico, só o suaviza, porque a chance de um pool vencer não
+sabe quantas vagas ele tem. Por isso a fatia de cada candidato tem teto derivado da
+capacidade livre: um pool com duas vagas nunca recebe a enxurrada que um com sessenta
+receberia, e o excedente escorre para o próximo melhor.
 
 O detalhamento, com as alternativas descartadas em cada decisão, está na
 [arquitetura](docs/arquitetura.md).
@@ -79,11 +93,13 @@ O detalhamento, com as alternativas descartadas em cada decisão, está na
 
 | Comando | O que faz |
 |---|---|
-| `make dev` | Ambiente completo em um comando |
+| `make dev` | Ambiente completo em um comando, sem Docker |
+| `make dev-aws` | O mesmo fluxo contra o LocalStack |
 | `make test` | Suíte inteira com o gate de cobertura de 85% no domínio |
 | `make test-fast` | Só domínio, propriedades e contrato. Roda em milissegundos, sem simular AWS. |
 | `make check` | Tudo que o CI roda: lint, tipos, testes e auditoria de dependência |
 | `make load` | Pico de 2.000 requests simultâneos com k6 |
+| `make tf-validate` | Formata e valida o Terraform |
 | `make package` | Monta o zip de deploy |
 | `make demo` | Sobe tudo em container |
 

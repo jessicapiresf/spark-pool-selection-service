@@ -19,6 +19,7 @@ from pool_selection.adapters.dynamodb_counters import DynamoDBCounterStore
 from pool_selection.adapters.ec2_catalog import EC2InstanceCatalogProvider
 from pool_selection.adapters.ec2_placement import EC2PlacementScoreProvider
 from pool_selection.adapters.s3_snapshots import S3SnapshotStore
+from pool_selection.adapters.secrets import SecretsManagerResolver, SecretUnavailableError
 from pool_selection.config import Settings, settings
 from pool_selection.domain.catalog import build_catalog
 from pool_selection.domain.pool import MalformedPoolIdError, PoolId, Profile
@@ -72,14 +73,25 @@ class AggregationReport:
         }
 
 
-def minutes_to_process(through: str | None, now: datetime, cap: int) -> tuple[list[str], int]:
+def minutes_to_process(
+    through: str | None, now: datetime, cap: int, lag_minutes: int = 0
+) -> tuple[list[str], int]:
     """Minutos fechados que faltam consumir, e quantos ficaram para tras.
 
     O corte e explicito: se a agregadora ficou parada tempo demais, os minutos mais
     antigos ja decairam a quase nada e reprocessa-los custaria mais do que valem. O que
     foi descartado sai em metrica, para nao virar buraco silencioso.
+
+    `lag_minutes` e a folga antes de dar um minuto por fechado. O evento passa pela
+    notificacao do S3, pela fila e pela janela de lote de vinte segundos da ingestora,
+    entao o contador de um minuto costuma chegar depois do proprio minuto. Sem a folga,
+    esse contador e lido tarde demais: o marco ja avancou e ele nunca mais e consultado.
+    O custo e que a recomendacao passa a olhar alguns minutos para tras, o que a meia-vida
+    de vinte minutos absorve sem mudar nada na pratica.
     """
-    last_closed = (now - timedelta(minutes=1)).replace(second=0, microsecond=0)
+    last_closed = (now - timedelta(minutes=1 + max(0, lag_minutes))).replace(
+        second=0, microsecond=0
+    )
     if through is None:
         start = last_closed - timedelta(minutes=BOOTSTRAP_MINUTES - 1)
     else:
@@ -152,9 +164,12 @@ def aggregate(
     catalog_refreshed_at: datetime | None,
     now: datetime,
     max_minutes: int,
+    lag_minutes: int = 0,
 ) -> tuple[Snapshot, AggregationReport]:
     report = AggregationReport()
-    stamps, report.skipped_minutes = minutes_to_process(previous.through_minute, now, max_minutes)
+    stamps, report.skipped_minutes = minutes_to_process(
+        previous.through_minute, now, max_minutes, lag_minutes
+    )
 
     pool_evidence = {pool.pool_id.value: pool.evidence for pool in previous.pools}
     job_evidence: dict[str, dict[str, Evidence]] = {
@@ -338,6 +353,7 @@ def run(
         catalog_refreshed_at=catalog_refreshed_at,
         now=now,
         max_minutes=config.aggregator_max_minutes,
+        lag_minutes=config.aggregator_lag_minutes,
     )
     report.catalog_refreshed = report_catalog
     report.placement_refreshed = report_placement
@@ -353,14 +369,35 @@ def _parseable(pool_id: str) -> bool:
     return True
 
 
+def databricks_token(config: Settings, resolver: SecretsManagerResolver | None = None) -> str:
+    """O token vem do Secrets Manager em producao e da variavel de ambiente localmente.
+
+    Sem isto o provider de capacidade nunca liga em producao, porque o Terraform entrega
+    o ARN do segredo e nao o valor, e a falha e silenciosa: o servico volta a operar so
+    com o historico sem nada indicar que uma das tres fontes sumiu.
+    """
+    if config.databricks_token:
+        return config.databricks_token
+    if not config.databricks_token_secret:
+        return ""
+    try:
+        return (resolver or SecretsManagerResolver()).resolve(config.databricks_token_secret)
+    except SecretUnavailableError as error:
+        log("token_databricks_indisponivel", error=str(error))
+        return ""
+
+
 def handler(_event: dict[str, Any] | None = None, _context: Any = None) -> dict[str, Any]:
     configure_logging()
     config = settings()
+    token = databricks_token(config)
     capacity_provider = (
-        DatabricksCapacityProvider(config.databricks_host, config.databricks_token)
-        if config.databricks_host and config.databricks_token
+        DatabricksCapacityProvider(config.databricks_host, token)
+        if config.databricks_host and token
         else None
     )
+    if config.databricks_host and not token:
+        log("capacidade_desligada_sem_token")
     report = run(
         snapshots=S3SnapshotStore(config.snapshot_bucket, config.snapshot_key),
         store=DynamoDBCounterStore(config.counters_table),

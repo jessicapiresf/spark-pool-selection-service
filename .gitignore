@@ -1,6 +1,7 @@
 # 1. ENVIRONMENTS
 .env
 .env.*
+!.env.example
 
 # 2. PLUGINS
 plugins/*
@@ -20,3 +21,4 @@ htmlcov/
 .hypothesis/
 __pycache__/
 *.py[cod]
+.local/

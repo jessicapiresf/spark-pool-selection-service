@@ -2,8 +2,12 @@
 
 Duas coisas nao sao detalhe aqui. A pre-agregacao em memoria transforma milhares de
 escritas em poucas, uma por par de pool e minuto, sem a qual o ingestor vira o gargalo. E
-a reivindicacao por objeto do S3 impede que um lote reentregue conte a mesma falha de
-novo: a entrega do SQS e at-least-once.
+o controle por objeto do S3 impede que um lote reentregue conte a mesma falha de novo: a
+entrega do SQS e at-least-once.
+
+O objeto e marcado como processado **depois** de os contadores irem para o banco. Marcar
+antes trocaria contagem dobrada por perda silenciosa, que e o erro pior: dobrar decai
+junto com o resto do historico, perder abre buraco que ninguem ve.
 """
 
 from __future__ import annotations
@@ -55,17 +59,23 @@ def ingest(
     pool_totals: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0.0, 0.0])
     job_totals: dict[tuple[str, str], list[float]] = defaultdict(lambda: [0.0, 0.0])
 
-    for record in records:
+    identities = {
+        f"{record['bucket']}/{record['key']}#{record.get('etag', '')}": record for record in records
+    }
+    already = store.processed(identities)
+    pending: list[str] = []
+
+    for identity, record in identities.items():
         bucket = record["bucket"]
         key = record["key"]
-        identity = f"{bucket}/{key}#{record.get('etag', '')}"
 
-        if not store.claim(identity):
+        if identity in already:
             report.skipped_objects += 1
             log("objeto_ja_processado", bucket=bucket, key=key)
             continue
 
         report.objects += 1
+        pending.append(identity)
         for line in read_object(bucket, key):
             try:
                 event = JobEvent.parse(json.loads(line))
@@ -96,8 +106,10 @@ def ingest(
         CounterDelta(CounterKey(Scope.JOB, key, minute), values[0], values[1])
         for (minute, key), values in job_totals.items()
     ]
+    # A ordem importa: gravar e so entao marcar. Ver `mark_processed` no contrato.
     store.add(deltas)
     report.writes = len(deltas)
+    store.mark_processed(pending)
     return report
 
 

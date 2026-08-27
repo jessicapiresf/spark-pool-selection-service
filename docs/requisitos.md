@@ -25,7 +25,7 @@ linha, então a leitura é linha a linha e não um `json.load` do arquivo inteir
 
 | ID | Requisito | Origem | Onde |
 |---|---|---|---|
-| RF-01 | Endpoint `/get-pool` que devolve um ID de pool. | Pedido | [Contrato](arquitetura.md#5-contrato-do-endpoint) |
+| RF-01 | Endpoint que devolve um ID de pool. O enunciado cita `/get-pool` e `/get-pools`, e o serviço responde nos dois. | Pedido | [Contrato](arquitetura.md#5-contrato-do-endpoint) |
 | RF-02 | O pool devolvido deve ter alta probabilidade de o job rodar sem perder instâncias spot. | Pedido | [Seleção](arquitetura.md#3-como-o-pool-é-escolhido) |
 | RF-03 | Aceitar parâmetros que restrinjam os tipos de instância (ex. só memória, só CPU). | Pedido | [Contrato](arquitetura.md#5-contrato-do-endpoint) e [perfil](arquitetura.md#de-onde-sai-o-perfil-de-um-tipo-de-instância) |
 | RF-04 | Resposta válida a qualquer momento do dia, acompanhando a variação de disponibilidade. | Derivado | [Como funciona](arquitetura.md#2-como-funciona) |
@@ -40,9 +40,9 @@ linha, então a leitura é linha a linha e não um `json.load` do arquivo inteir
 |---|---|---|---|
 | RNF-01 | Python acima de 3.9. | Pedido | Python 3.13, com o [motivo](arquitetura.md#5-contrato-do-endpoint) |
 | RNF-02 | Alta disponibilidade. | Pedido | [Disponibilidade](arquitetura.md#4-disponibilidade-e-degradação) |
-| RNF-03 | Escalar para picos imprevisíveis, sem falhar na hora de obter um pool. | Pedido | [Escala](arquitetura.md#7-escala) |
+| RNF-03 | Escalar para picos imprevisíveis, sem falhar na hora de obter um pool. | Pedido | [Escala](arquitetura.md#7-escala) e [teto por capacidade](arquitetura.md#o-sorteio-sozinho-não-segura-um-pico) |
 | RNF-04 | Pronta para produção. | Pedido | [CI/CD e testes](arquitetura.md#10-cicd-e-testes) |
-| RNF-05 | Ambiente de dev em um comando, isolado. | Pedido | `make dev` na [fase 3](arquitetura.md#9-o-que-será-construído) |
+| RNF-05 | Ambiente de dev em um comando, isolado, respondendo em `http://localhost:5050/get-pools`. | Pedido | `make dev`, sem Docker, na [fase 3](arquitetura.md#9-o-que-foi-construído) |
 
 ## Documentação e processo
 
@@ -64,6 +64,7 @@ Deixadas em aberto de propósito. O racional de cada uma está na arquitetura.
 | Framework | FastAPI |
 | Banco de dados | DynamoDB para contadores, S3 para o snapshot |
 | Formato da resposta | JSON com pool, score, evidência, capacidade e alternativas |
+| Espalhamento no pico | Teto por capacidade sobre o sorteio, sem estado compartilhado |
 | Classificação de perfil | Derivada de `DescribeInstanceTypes`, não tabela fixa no código |
 | Fonte preditiva | Spot placement score da AWS, por perfil, a cada 5 minutos |
 | Autenticação | IAM na Function URL |
@@ -73,7 +74,7 @@ Deixadas em aberto de propósito. O racional de cada uma está na arquitetura.
 
 | ID | Premissa | Se estiver errada |
 |---|---|---|
-| P-01 | "Ambiente isolado" significa ambiente virtual por projeto na máquina do desenvolvedor. | Se a exigência for container obrigatório, muda a ferramenta de dependências. |
+| P-01 | "Ambiente isolado" significa ambiente virtual por projeto na máquina do desenvolvedor, criado pelo `uv`, que instala o próprio Python. | Se a exigência for container obrigatório, `docker compose up` cobre o mesmo caminho. |
 | P-02 | O job informa seu `job_id` na chamada. | Sem ele, some o fator de adequação e job leve e pesado recebem a mesma resposta. |
 | P-03 | A plataforma roda Databricks, porque "pool de instâncias" é vocabulário dela. | Some a fonte de capacidade ao vivo e o serviço fica só com o histórico de falhas. |
 | P-04 | Só existe evento de job que terminou. Job que nunca subiu pode não gerar registro. | Pool ruim demais apareceria saudável por ausência de dado. |
@@ -93,6 +94,7 @@ estas são as metas adotadas.
 | Disponibilidade | responde algo mesmo com o snapshot indisponível |
 | Frescor do dado | snapshot com no máximo 90 segundos |
 | Pico suportado | 2.000 requests simultâneos sem throttling |
+| Concentração no pico | nenhum pool recebe fatia maior do que a folga dele comporta |
 | Reação a queda de AZ, com previsão | recomendação migra em até 5 minutos, sem esperar falha |
 | Reação a queda de AZ, só pelo histórico | recomendação migra em até 20 minutos |
 

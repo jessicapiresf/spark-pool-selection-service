@@ -33,9 +33,10 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = merge(local.common_environment, {
-      FALLBACK_POOLS       = join(",", var.fallback_pools)
-      SNAPSHOT_TTL_SECONDS = "30"
-      STALE_AFTER_SECONDS  = "300"
+      FALLBACK_POOLS         = join(",", var.fallback_pools)
+      SNAPSHOT_TTL_SECONDS   = "30"
+      STALE_AFTER_SECONDS    = "300"
+      CAPACITY_CONCENTRATION = tostring(var.capacity_concentration)
     })
   }
 
@@ -95,7 +96,10 @@ resource "aws_lambda_event_source_mapping" "events" {
     maximum_concurrency = 10
   }
 
-  function_response_types = ["ReportBatchItemFailures"]
+  # Sem `ReportBatchItemFailures`: a ingestora pre-agrega o lote inteiro antes de escrever,
+  # entao nao existe "esta mensagem falhou e aquela nao". O lote e uma unidade. Declarar o
+  # recurso sem devolver `batchItemFailures` faria a AWS tratar toda resposta como sucesso
+  # total, o que e pior que nao declarar: parece protecao e nao e.
 }
 
 resource "aws_lambda_function" "aggregator" {
@@ -119,6 +123,7 @@ resource "aws_lambda_function" "aggregator" {
       PLACEMENT_REFRESH_SECONDS = "300"
       CATALOG_REFRESH_SECONDS   = "86400"
       AGGREGATOR_MAX_MINUTES    = "360"
+      AGGREGATOR_LAG_MINUTES    = tostring(var.aggregator_lag_minutes)
     })
   }
 

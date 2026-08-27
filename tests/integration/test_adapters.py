@@ -2,8 +2,8 @@
 
 LocalStack fica para o ambiente de dev. Aqui o moto e mais rapido e nao precisa de Docker
 no CI, e o que interessa e provar que o contrato que o dominio assume sobrevive ao
-comportamento real do DynamoDB e do S3, principalmente o incremento atomico e a escrita
-condicional.
+comportamento real do DynamoDB e do S3, principalmente o incremento atomico e o
+controle de objeto ja processado.
 """
 
 from __future__ import annotations
@@ -18,9 +18,11 @@ from moto import mock_aws
 
 from pool_selection.adapters.dynamodb_counters import DynamoDBCounterStore
 from pool_selection.adapters.s3_snapshots import S3SnapshotStore
+from pool_selection.domain.events import Weights
 from pool_selection.domain.pool import PoolId, Profile
 from pool_selection.domain.scoring import Capacity, Evidence, PlacementForecast, SpotAvailability
 from pool_selection.domain.snapshot import PoolEntry, Snapshot
+from pool_selection.entrypoints.ingestor.handler import ingest
 from pool_selection.ports.counters import CounterDelta, CounterKey, Scope
 from pool_selection.ports.snapshots import SnapshotUnavailableError
 
@@ -101,12 +103,55 @@ def test_delta_zerado_nao_gera_escrita(dynamodb) -> None:
     assert store.read_minute("2026-08-25T11:59").is_empty
 
 
-def test_escrita_condicional_impede_reprocessar_o_mesmo_objeto(dynamodb) -> None:
+def test_objeto_marcado_nao_e_reprocessado(dynamodb) -> None:
     """A prova de que uma reentrega do SQS nao conta a mesma falha duas vezes."""
     store = DynamoDBCounterStore("counters", dynamodb)
-    assert store.claim("eventos/a.json#etag1") is True
-    assert store.claim("eventos/a.json#etag1") is False
-    assert store.claim("eventos/a.json#etag2") is True
+    identidades = ["eventos/a.json#etag1", "eventos/b.json#etag1"]
+
+    assert store.processed(identidades) == set()
+    store.mark_processed(["eventos/a.json#etag1"])
+
+    assert store.processed(identidades) == {"eventos/a.json#etag1"}
+    # Mesmo arquivo, conteudo novo: etag diferente, objeto diferente.
+    assert store.processed(["eventos/a.json#etag2"]) == set()
+
+
+def test_consulta_de_processados_acima_do_limite_de_lote(dynamodb) -> None:
+    """O BatchGetItem so aceita cem chaves, e um lote do SQS traz ate mil objetos."""
+    store = DynamoDBCounterStore("counters", dynamodb)
+    identidades = [f"eventos/{n}.json#etag" for n in range(250)]
+    marcados = identidades[::2]
+    store.mark_processed(marcados)
+
+    assert store.processed(identidades) == set(marcados)
+
+
+def test_marca_so_depois_de_gravar_para_nao_perder_evento(dynamodb) -> None:
+    """Se a escrita dos contadores falha, o objeto nao pode ficar marcado.
+
+    Marcar antes trocaria contagem dobrada por perda silenciosa. Aqui a escrita estoura no
+    meio e o objeto precisa continuar elegivel para a reentrega.
+    """
+    store = DynamoDBCounterStore("counters", dynamodb)
+
+    def explode(_deltas):
+        raise RuntimeError("dynamo fora do ar")
+
+    store.add = explode  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        ingest(
+            [{"bucket": "eventos", "key": "a.json", "etag": "etag1"}],
+            store,
+            lambda _b, _k: iter(
+                [
+                    '{"finished_at":"2026-08-25T11:59:00","job_id":"j",'
+                    '"pool_id":"pool-r6.xlarge-us-east-1a","status":"SUCCESS"}'
+                ]
+            ),
+            Weights(),
+        )
+
+    assert store.processed(["eventos/a.json#etag1"]) == set()
 
 
 def test_contadores_recebem_ttl(dynamodb) -> None:

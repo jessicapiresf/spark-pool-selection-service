@@ -1,24 +1,37 @@
-# O requisito e um comando so. `make dev` instala tudo isolado, sobe as dependencias,
-# popula dado e liga a API. Nao ha passo manual entre clonar e ver o endpoint responder.
+# O requisito e um comando so, isolado, com o endpoint respondendo. `make dev` faz isso
+# sem Docker: o uv instala o proprio Python, o seed roda o pipeline de verdade em memoria e
+# grava o snapshot num arquivo, e a API sobe lendo dele. Nao ha passo manual entre clonar e
+# ver o endpoint responder, e nao ha pre-requisito alem do uv.
+#
+# `make dev-aws` e o mesmo fluxo contra o LocalStack, para exercitar os adapters de AWS.
 
 SHELL := /bin/bash
 UV := $(shell command -v uv 2>/dev/null || echo "$$HOME/.local/bin/uv")
 RUN := $(UV) run
-export AWS_ENDPOINT_URL ?= http://localhost:4566
-export AWS_ACCESS_KEY_ID ?= local
-export AWS_SECRET_ACCESS_KEY ?= local
-export AWS_DEFAULT_REGION ?= us-east-1
-export SNAPSHOT_BUCKET ?= pool-selection-local
-export COUNTERS_TABLE ?= pool-selection-counters
+PORT ?= 5050
 export FALLBACK_POOLS ?= pool-r6.xlarge-us-east-1a,pool-c6.xlarge-us-east-1a
 
+# `SNAPSHOT_PATH` e o que decide entre ler do disco e ler do S3, entao ele nao pode ser
+# exportado no topo: os alvos de LocalStack precisam dele vazio, e um valor global vazaria
+# para eles e faria a API ler o arquivo em vez do bucket.
+LOCAL_SNAPSHOT := .local/snapshot/pools.json.gz
+LOCALSTACK_ENV := \
+	AWS_ENDPOINT_URL=http://localhost:4566 \
+	AWS_ACCESS_KEY_ID=local \
+	AWS_SECRET_ACCESS_KEY=local \
+	AWS_DEFAULT_REGION=us-east-1 \
+	SNAPSHOT_BUCKET=pool-selection-local \
+	COUNTERS_TABLE=pool-selection-counters
+
 .DEFAULT_GOAL := help
-.PHONY: help dev install localstack seed serve test test-fast lint fmt typecheck audit check clean down demo load package tf-validate
+.PHONY: help dev dev-aws install localstack seed seed-aws serve serve-aws test test-fast lint fmt typecheck audit check clean down demo load package tf-validate
 
 help:  ## Lista os alvos
 	@grep -hE '^[a-z-]+:.*?##' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "};{printf "  \033[36m%-12s\033[0m %s\n",$$1,$$2}'
 
-dev: install localstack seed serve  ## Ambiente completo em um comando
+dev: install seed serve  ## Ambiente completo em um comando, sem Docker
+
+dev-aws: install localstack seed-aws serve-aws  ## O mesmo fluxo contra o LocalStack
 
 install:  ## Cria o ambiente virtual isolado e instala as dependencias travadas
 	@command -v $(UV) >/dev/null || { echo "uv nao encontrado: https://docs.astral.sh/uv/"; exit 1; }
@@ -28,16 +41,26 @@ localstack:  ## Sobe o LocalStack e espera ficar saudavel
 	docker compose up -d localstack
 	@echo "aguardando o LocalStack..."
 	@for i in $$(seq 1 40); do \
-		curl -sf $$AWS_ENDPOINT_URL/_localstack/health >/dev/null && exit 0; \
+		curl -sf http://localhost:4566/_localstack/health >/dev/null && exit 0; \
 		sleep 1; \
 	done; echo "LocalStack nao respondeu a tempo"; exit 1
 
-seed:  ## Cria os recursos, gera eventos sinteticos e publica um snapshot
-	$(RUN) python tools/seed_local.py
+seed:  ## Gera eventos sinteticos e publica um snapshot num arquivo local
+	SNAPSHOT_PATH=$(LOCAL_SNAPSHOT) $(RUN) python tools/seed_local.py --mode file
 
-serve:  ## Liga a API com reload
-	@echo "API em http://localhost:8000  |  OpenAPI em http://localhost:8000/docs"
-	$(RUN) uvicorn pool_selection.entrypoints.api.app:app --reload --port 8000
+seed-aws:  ## O mesmo, criando os recursos no LocalStack
+	$(LOCALSTACK_ENV) $(RUN) python tools/seed_local.py --mode aws
+
+serve:  ## Liga a API lendo o snapshot do disco, com reload
+	@echo "API em http://localhost:$(PORT)/get-pools"
+	@echo "OpenAPI em http://localhost:$(PORT)/docs"
+	SNAPSHOT_PATH=$(LOCAL_SNAPSHOT) \
+	$(RUN) uvicorn pool_selection.entrypoints.api.app:app --reload --port $(PORT)
+
+serve-aws:  ## Liga a API lendo o snapshot do LocalStack
+	@echo "API em http://localhost:$(PORT)/get-pools  (snapshot vindo do LocalStack)"
+	$(LOCALSTACK_ENV) \
+	$(RUN) uvicorn pool_selection.entrypoints.api.app:app --reload --port $(PORT)
 
 demo:  ## Sobe tudo em container, sem precisar de Python na maquina
 	docker compose up --build
@@ -94,5 +117,5 @@ down:  ## Derruba os containers
 	docker compose down -v
 
 clean: down  ## Remove ambiente virtual e caches
-	rm -rf .venv .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov
+	rm -rf .venv .pytest_cache .ruff_cache .mypy_cache .coverage htmlcov .local
 	find . -name __pycache__ -type d -prune -exec rm -rf {} +

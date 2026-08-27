@@ -56,6 +56,28 @@ def test_nada_a_fazer_quando_ja_esta_em_dia() -> None:
     assert minutes_to_process("2026-08-25T11:59", NOW, cap=360) == ([], 0)
 
 
+def test_folga_espera_o_contador_atrasado_chegar() -> None:
+    """O contador de um minuto chega depois do minuto, e sem folga ele nunca e lido.
+
+    A ingestora agrupa por ate vinte segundos e a notificacao do S3 tem latencia propria,
+    entao o minuto 11:59 so vira contador em algum momento de 12:00. Uma rodada em
+    12:00:30 sem folga fecharia 11:59 antes de o dado existir, e o marco avancaria em cima
+    de um minuto vazio.
+    """
+    sem_folga, _ = minutes_to_process("2026-08-25T11:56", NOW, cap=360, lag_minutes=0)
+    com_folga, _ = minutes_to_process("2026-08-25T11:56", NOW, cap=360, lag_minutes=2)
+
+    assert sem_folga[-1] == "2026-08-25T11:59"
+    assert com_folga[-1] == "2026-08-25T11:57"
+    # Nada e descartado: o que a folga faz e adiar, nao pular.
+    assert set(com_folga) < set(sem_folga)
+
+
+def test_folga_nao_reprocessa_minuto_ja_fechado() -> None:
+    stamps, _ = minutes_to_process("2026-08-25T11:57", NOW, cap=360, lag_minutes=2)
+    assert stamps == []
+
+
 def test_parada_longa_descarta_o_excedente_e_reporta() -> None:
     """Minuto antigo ja decaiu a quase nada; reprocessar custa mais do que vale."""
     stamps, skipped = minutes_to_process("2026-08-24T12:00", NOW, cap=60)
@@ -185,7 +207,7 @@ def test_fonte_externa_indisponivel_nao_derruba_a_rodada() -> None:
         Quebrado(),
         None,
         None,
-        Settings(),
+        Settings(aggregator_lag_minutes=0),
         now=NOW,
     )
     assert report.pools == 1
@@ -204,7 +226,7 @@ def test_rodada_completa_com_as_tres_fontes() -> None:
         StaticCapacityProvider(capacities),
         StaticPlacementScoreProvider({("us-east-1a", "memory"): PlacementForecast(7, 14, NOW)}),
         StaticInstanceCatalogProvider([InstanceSpec("r6.xlarge", 4, 32768)]),
-        Settings(),
+        Settings(aggregator_lag_minutes=0),
         now=NOW,
     )
     saved = snapshots.load()
