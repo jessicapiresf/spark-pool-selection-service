@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.5.11"
+
+permissions:
+  contents: read
+
+jobs:
+  qualidade:
+    name: Lint, tipos e testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Instala as dependencias travadas
+        run: uv sync --all-extras --frozen
+
+      - name: Lint e formatacao
+        run: |
+          uv run ruff check --output-format=github src tests tools
+          uv run ruff format --check src tests tools
+
+      - name: Tipagem estrita no dominio
+        run: uv run mypy
+
+      - name: Testes com o gate de cobertura
+        run: uv run pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.xml
+
+  seguranca:
+    name: Vulnerabilidade em dependencia
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      # Audita o conjunto resolvido, nao o ambiente: e exatamente o que vai para producao,
+      # e o proprio projeto nao esta no PyPI para ser auditado.
+      - run: |
+          mkdir -p dist
+          uv export --frozen --all-extras --no-emit-project -o dist/requirements-audit.txt
+          uv run pip-audit --strict --disable-pip -r dist/requirements-audit.txt
+
+  pacote:
+    name: Build do artefato
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Monta o zip
+        run: make package
+
+      - name: Configura emulacao QEMU para ARM64
+        uses: docker/setup-qemu-action@v3
+
+      # O pacote precisa importar no runtime de verdade, nao no ubuntu do runner: o
+      # pydantic_core e extensao nativa e o alvo e arm64.
+      - name: Verifica o import no runtime do Lambda
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/dist/build:/var/task:ro" \
+            --entrypoint python public.ecr.aws/lambda/python:3.13 -c "
+          import sys; sys.path.insert(0, '/var/task')
+          from pool_selection.entrypoints.api.handler import handler
+          from pool_selection.entrypoints.ingestor.handler import handler as i
+          from pool_selection.entrypoints.aggregator.handler import handler as a
+          print('ok')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: dist/pool_selection.zip
+          retention-days: 7
+
+  infra:
+    name: Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: pacote
+    permissions:
+      contents: read
+      id-token: write # OIDC, em vez de chave estatica no repositorio
+    env:
+      AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambda-package
+          path: dist
+
+      - name: Formatacao
+        run: terraform -chdir=infra fmt -check -recursive
+
+      - name: Validacao sem credencial
+        run: |
+          terraform -chdir=infra init -backend=false -input=false
+          terraform -chdir=infra validate
+
+      # O plan precisa de credencial, entao so roda quando o secret estiver configurado no repositorio.
+      - name: Credenciais por OIDC
+        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && env.AWS_PLAN_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Plan em staging
+        if: (github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'push') && env.AWS_PLAN_ROLE_ARN != ''
+        run: |
+          terraform -chdir=infra init -backend-config=backends/staging.hcl -input=false
+          terraform -chdir=infra plan -var-file=envs/staging.tfvars -input=false -no-color

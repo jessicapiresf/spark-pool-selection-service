@@ -1,6 +1,24 @@
-# 1. ENVIRONMENTS 
+# 1. ENVIRONMENTS
 .env
 .env.*
+!.env.example
 
-# 2. 
+# 2. PLUGINS
 plugins/*
+
+# 3. FERRAMENTAS LOCAIS
+.claude/
+dist/
+.venv/
+infra/.terraform/
+infra/.terraform.lock.hcl
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+__pycache__/
+*.py[cod]
+.local/
