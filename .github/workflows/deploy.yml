@@ -101,6 +101,11 @@ jobs:
           CURRENT=$(aws lambda get-alias --function-name "$FUNCTION" --name live \
             --query FunctionVersion --output text)
 
+          if [ "$VERSION" = "$CURRENT" ]; then
+            echo "Primeiro deploy da versao $VERSION: alias live ja esta na versao atual."
+            exit 0
+          fi
+
           aws lambda update-alias --function-name "$FUNCTION" --name live \
             --function-version "$CURRENT" \
             --routing-config "AdditionalVersionWeights={$VERSION=0.1}"
