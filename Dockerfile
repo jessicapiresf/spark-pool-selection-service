@@ -8,11 +8,11 @@ ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
 # As dependencias mudam bem menos que o codigo, entao instalar antes de copiar o resto
 # aproveita o cache de camada na maioria das reconstrucoes.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-install-project
+RUN uv sync --frozen --all-extras --no-install-project
 
 COPY src/ src/
 COPY tools/ tools/
-RUN uv sync --frozen
+RUN uv sync --frozen --all-extras
 
 ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH="/app/src:/app/tools"
 

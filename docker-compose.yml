@@ -28,7 +28,7 @@ services:
     volumes:
       - dados:/dados
     command:
-      ["uvicorn", "pool_selection.entrypoints.api.app:app", "--host", "0.0.0.0", "--port", "5050"]
+      ["python", "-m", "uvicorn", "pool_selection.entrypoints.api.app:app", "--host", "0.0.0.0", "--port", "5050"]
 
   localstack:
     profiles: ["aws"]
