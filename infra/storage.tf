@@ -1,3 +1,7 @@
+resource "aws_s3_bucket" "events" {
+  bucket = "${var.events_bucket}-${data.aws_caller_identity.current.account_id}"
+}
+
 # O snapshot vive separado dos eventos: sao ciclos de vida diferentes. O evento e dado
 # bruto que se guarda; o snapshot e derivado e reconstruivel a cada minuto.
 resource "aws_s3_bucket" "snapshot" {

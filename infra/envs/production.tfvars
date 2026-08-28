@@ -2,7 +2,7 @@ environment   = "production"
 events_bucket = "dados-plataforma-producao"
 events_prefix = "spark-job-events/"
 
-api_reserved_concurrency = 400
+api_reserved_concurrency = -1
 
 # Ultimo recurso, usado so quando nao ha snapshot nenhum. Um por AZ, para a escolha
 # uniforme nao concentrar tudo em uma zona.

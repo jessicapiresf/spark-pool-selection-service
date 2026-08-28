@@ -29,7 +29,7 @@ resource "aws_lambda_function" "api" {
   filename         = var.artifacts_path
   source_code_hash = filebase64sha256(var.artifacts_path)
 
-  reserved_concurrent_executions = var.api_reserved_concurrency
+  reserved_concurrent_executions = var.api_reserved_concurrency > 0 ? var.api_reserved_concurrency : -1
 
   environment {
     variables = merge(local.common_environment, {

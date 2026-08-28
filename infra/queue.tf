@@ -32,7 +32,7 @@ data "aws_iam_policy_document" "queue_from_s3" {
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values   = ["arn:aws:s3:::${var.events_bucket}"]
+      values   = [aws_s3_bucket.events.arn]
     }
 
     condition {
@@ -49,7 +49,7 @@ resource "aws_sqs_queue_policy" "events" {
 }
 
 resource "aws_s3_bucket_notification" "events" {
-  bucket = var.events_bucket
+  bucket = aws_s3_bucket.events.id
 
   queue {
     queue_arn     = aws_sqs_queue.events.arn
