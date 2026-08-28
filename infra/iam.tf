@@ -45,7 +45,7 @@ data "aws_iam_policy_document" "ingestor" {
 
   statement {
     effect    = "Allow"
-    actions   = ["dynamodb:UpdateItem", "dynamodb:PutItem"]
+    actions   = ["dynamodb:UpdateItem", "dynamodb:PutItem", "dynamodb:BatchGetItem"]
     resources = [aws_dynamodb_table.counters.arn]
   }
 
