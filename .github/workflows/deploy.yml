@@ -36,7 +36,9 @@ jobs:
 
       - run: make package
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Autentica na AWS por OIDC
+        if: secrets.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -74,7 +76,9 @@ jobs:
 
       - run: make package
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Autentica na AWS por OIDC
+        if: secrets.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
