@@ -45,11 +45,6 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-skip-session-tagging: true
 
-      - name: Garante bucket S3 do estado do Terraform
-        run: |
-          aws s3api head-bucket --bucket "terraform-state-spark-pool-248900628423" 2>/dev/null || \
-          aws s3api create-bucket --bucket "terraform-state-spark-pool-248900628423" --region us-east-1
-
       - name: Apply
         run: |
           terraform -chdir=infra init -backend-config=backends/staging.hcl -input=false
@@ -91,11 +86,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
           role-skip-session-tagging: true
-
-      - name: Garante bucket S3 do estado do Terraform
-        run: |
-          aws s3api head-bucket --bucket "terraform-state-spark-pool-248900628423" 2>/dev/null || \
-          aws s3api create-bucket --bucket "terraform-state-spark-pool-248900628423" --region us-east-1
 
       - name: Apply
         run: |
