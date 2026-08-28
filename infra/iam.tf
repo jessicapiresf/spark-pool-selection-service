@@ -40,7 +40,7 @@ data "aws_iam_policy_document" "ingestor" {
   statement {
     effect    = "Allow"
     actions   = ["s3:GetObject"]
-    resources = ["arn:aws:s3:::${var.events_bucket}/${var.events_prefix}*"]
+    resources = ["${aws_s3_bucket.events.arn}/${var.events_prefix}*"]
   }
 
   statement {
