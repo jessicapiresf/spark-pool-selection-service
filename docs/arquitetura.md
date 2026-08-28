@@ -25,59 +25,65 @@ duas coisas.
 pool, e uma API que serve o resultado. O que muda tudo é a latência exigida na ponta. Um
 dashboard aceita cinco segundos. Um job que está subindo, não.
 
+### 1.1 Contexto e Economia de Nuvem: Entendendo o valor (Spot vs DBU)
+
+Para contextualizar quem é leigo no modelo financeiro de plataformas de dados como Databricks na AWS ou Azure:
+
+* **Como a cobrança funciona:** O custo de rodar um job Spark é a soma de **Software (DBU da Databricks)** + **Hardware (EC2 da AWS ou VM da Azure)**. O valor do DBU (licença) é fixo, mas o hardware em instâncias **Spot** custa entre **70% e 90% mais barato** que o preço normal (On-Demand).
+* **O risco do Spot:** As instâncias Spot utilizam a capacidade ociosa dos datacenters. Se a demanda na nuvem aumentar, a AWS/Azure retoma essas máquinas com um aviso de apenas 2 minutos (`SPOT_INSTANCE_TERMINATION`), fazendo o job Spark morrer.
+* **Onde o serviço gera valor:**
+  1. **Economia massiva de infraestrutura:** Garante que a maior parte dos jobs consiga rodar em Spot com desconto.
+  2. **Evita desperdício de licenças (DBU):** Se um job de 45 minutos morre no minuto 40 por falta de capacidade, o tempo já rodado é perdido. A empresa paga o DBU e a infraestrutura daquele tempo jogado no lixo e precisa reexecutar o job. O serviço seleciona o pool com a menor chance de queda, garantindo que o job vá até o fim.
+
 ---
 
 ## 2. Como funciona
 
-Existem dois caminhos, e eles nunca se cruzam em tempo de request. É isso que faz a API
-ser rápida e barata ao mesmo tempo.
+A arquitetura é estruturada em **três fluxos independentes** que se dividem entre o processamento assíncrono em background (Escrita) e a consulta em tempo real (Leitura). O caminho de escrita e o de leitura **nunca se cruzam em tempo de requisição**, garantindo resposta em milissegundos (< 5ms) e baixíssimo custo por query.
+
+### 2.1 Fluxo 1: Ingestão de Eventos (Reativo por evento quando o job termina)
 
 ```mermaid
 flowchart LR
-  subgraph escrita["Escrita (assíncrona)"]
-    direction LR
-    S3[("S3 - json, 1 evento/linha")]
-    SQS[["SQS - fila e DLQ"]]
-    ING["Lambda ingestora"]
-    CNT[("DynamoDB - contadores")]
-    EB{{"EventBridge - a cada 60s"}}
-    AGG["Lambda agregadora"]
-    SNAP[("S3 - snapshot gzip")]
-    DBX["API de pools Databricks"]
-    SPS["EC2 Spot Placement Score"]
-
-    S3 -->|notifica| SQS
-    SQS -->|lote| ING
-    ING -->|soma| CNT
-    EB -->|dispara| AGG
-    CNT -->|histórico| AGG
-    DBX -->|capacidade agora| AGG
-    SPS -->|previsão por AZ| AGG
-    AGG -->|grava| SNAP
-  end
-
-  subgraph leitura["Leitura (caminho crítico)"]
-    direction LR
-    JOB(["Job Spark"])
-    FURL["Function URL"]
-    API["Lambda API (snapshot em memória)"]
-
-    JOB -->|GET /get-pool| FURL
-    FURL --> API
-  end
-
-  SNAP -.->|recarrega a cada 30s| API
+  JOB_END["Job Spark Termina"] -->|escreve log| EVENTS[("S3 de eventos\n(json)")]
+  EVENTS -->|ObjectCreated| SQS[["SQS + DLQ"]]
+  SQS -->|lote| ING["Lambda ingestora"]
+  ING -->|soma contadores| CNT[("DynamoDB\n(contadores por pool/minuto)")]
 ```
 
-Quando um job termina, a plataforma escreve a linha no S3. O S3 avisa a fila, a fila
-entrega em lote para a ingestora, que classifica cada evento e soma contadores por pool e
-por minuto. Uma vez por minuto, a agregadora lê esses contadores, junta com a capacidade
-atual dos pools e com a previsão de spot da AWS, calcula o score de cada pool e grava um
-único arquivo comprimido com o ranking inteiro.
+Quando um job termina, a plataforma escreve uma linha de log no bucket S3 de eventos. A notificação `ObjectCreated` envia uma mensagem para a fila SQS, que entrega lotes para a **Lambda Ingestora**. Ela classifica cada evento e soma os contadores de falhas/sucessos no DynamoDB por pool e por minuto.
 
-Quando um job pergunta, a API já tem esse arquivo em memória, recarregado no máximo
-trinta segundos atrás. Ela filtra os candidatos, sorteia e responde. Na maior parte das
-vezes, nenhuma chamada de rede acontece.
+### 2.2 Fluxo 2: Agregação & Cálculo do Ranking (Agendado a cada 1 minuto)
+
+```mermaid
+flowchart TD
+  SCH{{"⏰ EventBridge Scheduler\n(Dispara sozinho a cada 1 min)"}}
+  
+  SCH -->|1. Invoca a cada 60s| AGG["Lambda Agregadora"]
+
+  subgraph bases["Bases e Fontes Consultadas"]
+    direction LR
+    CNT[("DynamoDB\n(Contadores)")] ~~~ DBX["Databricks API\n(Capacidade)"] ~~~ SPS["EC2 Spot Scores\n(Previsão AZ)"] ~~~ CATALOG["EC2 Catalog\n(Tipos)"]
+  end
+
+  AGG -->|2. Consulta| bases
+  AGG -->|3. Grava o ranking| SNAP[("S3: snapshot.json.gz\n(Ranking pré-calculado)")]
+```
+
+O EventBridge Scheduler invoca a **Lambda Agregadora** a cada 1 minuto. Ela lê os contadores acumulados no DynamoDB, busca a capacidade atual dos pools na Databricks e atualiza o catálogo de tipos e a previsão de spot na EC2 da AWS. Então, calcula o score estatístico de cada pool e grava um único arquivo comprimido (`snapshot.json.gz`) no S3 contendo o ranking inteiro pré-calculado.
+
+Em produção, a agregadora resolve o token da Databricks no Secrets Manager. A consulta de tipos de instância é renovada 1x ao dia e a previsão de placement a cada 5 minutos; ambas são preservadas no snapshot entre as execuções. Se alguma fonte externa falhar, a rodada continua com o último valor disponível.
+
+### 2.3 Fluxo 3: Consulta da API / Recomendação (Síncrono — Caminho Crítico ~5ms)
+
+```mermaid
+flowchart LR
+  JOB(["Job Spark"]) -->|1. GET /get-pool| API["Lambda API\n(Snapshot em memória RAM)"]
+  API -->|2. Resposta em ~5ms| RESULT["Pool Recomendado"]
+  SNAP[("S3: snapshot.json.gz")] -.->|Recarrega RAM a cada 30s| API
+```
+
+Quando um job Spark vai iniciar e consulta o endpoint (`GET /get-pool`), a **Lambda API** já possui esse arquivo de ranking carregado na sua memória RAM local (recarregado do S3 no máximo a cada 30 segundos). Ela aplica os filtros solicitados (`job_id`, `profile`, `availability_zones`), executa o sorteio (Thompson Sampling) e responde em cerca de 5ms. **Nenhuma chamada de rede externa ou consulta a banco de dados acontece durante a requisição.**
 
 ### Por que pré-calcular
 
