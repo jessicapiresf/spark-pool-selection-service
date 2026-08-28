@@ -37,7 +37,6 @@ jobs:
       - run: make package
 
       - name: Autentica na AWS
-        if: secrets.AWS_DEPLOY_ROLE_ARN != '' || secrets.AWS_ACCESS_KEY_ID != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
@@ -79,7 +78,6 @@ jobs:
       - run: make package
 
       - name: Autentica na AWS
-        if: secrets.AWS_DEPLOY_ROLE_ARN != '' || secrets.AWS_ACCESS_KEY_ID != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
