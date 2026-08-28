@@ -12,6 +12,7 @@ concurrency:
 env:
   UV_VERSION: "0.5.11"
   AWS_REGION: us-east-1
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
 
 permissions:
   contents: read
