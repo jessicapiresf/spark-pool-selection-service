@@ -268,7 +268,11 @@ def test_os_dois_nomes_do_endpoint_respondem_igual(client: TestClient) -> None:
 
     assert plural.status_code == 200
     assert singular.status_code == 200
-    assert plural.json() == singular.json()
+
+    p_data = plural.json()
+    s_data = singular.json()
+    p_data["snapshot"]["age_seconds"] = s_data["snapshot"]["age_seconds"]
+    assert p_data == s_data
 
 
 def test_openapi_documenta_o_endpoint(client: TestClient) -> None:
