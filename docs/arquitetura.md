@@ -22,95 +22,28 @@ Instâncias Spot oferecem até 90% de desconto na AWS, mas podem ser revogadas a
 
 A arquitetura separa o processamento em background (Escrita) da consulta em tempo real (Leitura). O caminho de leitura **não faz chamadas de rede externas**, garantindo latência **< 5ms**.
 
-### 2.0 Visão geral
+### 2.0 Visão Geral da Arquitetura
 
-```mermaid
-flowchart TD
-    subgraph Ingestao ["1 - Ingestao de Eventos"]
-        S3Ev["S3 Events Bucket\neventos brutos de jobs"]
-        SQS["Fila SQS\nbuffer + controle"]
-        Ing["Lambda Ingestora\nhandler.py"]
-        DDB[("DynamoDB\nCounters Table")]
-        DLQ["Fila DLQ\nmensagens mortas"]
-
-        S3Ev -->|s3:ObjectCreated| SQS
-        SQS -->|Lote 1000 msgs / 20s| Ing
-        Ing -->|UpdateItem / PutItem| DDB
-        SQS -.->|Falha 5x| DLQ
-    end
-
-    subgraph Agregacao ["2 - Agregacao - cron 1 min"]
-        Sched["EventBridge Scheduler"]
-        Agg["Lambda Agregadora\nhandler.py"]
-        EC2["AWS EC2 API"]
-        DBX["Databricks API"]
-        S3Snap["S3 Snapshot Bucket\npools.json.gz"]
-
-        Sched -->|rate 1 min| Agg
-        Agg -->|Query counters| DDB
-        Agg -->|GetSpotPlacementScores| EC2
-        Agg -->|ListInstancePools| DBX
-        Agg -->|PutObject| S3Snap
-    end
-
-    subgraph API ["3 - API de Selecao"]
-        Client["Cliente / Spark Job"]
-        APIGW["Lambda Function URL"]
-        APILam["Lambda API\nFastAPI + handler.py"]
-
-        Client -->|HTTP + SigV4| APIGW
-        APIGW --> APILam
-        APILam -->|GetObject - cache 30s| S3Snap
-    end
-```
+![Visão Geral da Arquitetura](images/arquitetura_diagrama.png)
 
 Os três componentes são Lambdas isoladas via IAM. Compartilham apenas o DynamoDB (contadores) e o S3 (snapshot).
 
 ### 2.1 Fluxo 1: Ingestão de Eventos (Assíncrono)
 
-```mermaid
-flowchart LR
-  JOB_END["Job Spark Termina"] -->|escreve log| EVENTS[("S3 de eventos\n(json)")]
-  EVENTS -->|ObjectCreated| SQS[["SQS + DLQ"]]
-  SQS -->|lote| ING["Lambda ingestora"]
-  ING -->|soma contadores| CNT[("DynamoDB\n(contadores por pool/minuto)")]
-```
-
-Ao término de um job, o log cai no S3 e notifica o SQS. A **Lambda Ingestora** consome em lotes (até 1.000 msgs ou 20s), classifica os eventos e incrementa contadores no DynamoDB agrupados por minuto e pool.
+Ao término de um job Spark, o log de execução é salvo no S3 e notifica a fila SQS. A **Lambda Ingestora** consome as mensagens em lotes (até 1.000 msgs ou a cada 20s), classifica os eventos (`SUCCESS`, `SPOT_TERMINATION`, etc.) e incrementa os contadores no DynamoDB agrupados por minuto e pool.
 
 ### 2.2 Fluxo 2: Agregação & Ranking (Cron 1 min)
 
-```mermaid
-flowchart TD
-  SCH{{"⏰ EventBridge Scheduler\n(Dispara a cada 1 min)"}}
-  SCH -->|Invoca| AGG["Lambda Agregadora"]
-
-  subgraph bases["Fontes Consultadas"]
-    direction LR
-    CNT[("DynamoDB\n(Contadores)")] ~~~ DBX["Databricks API\n(Capacidade)"] ~~~ SPS["EC2 Spot Scores\n(Previsão AZ)"] ~~~ CATALOG["EC2 Catalog\n(Tipos)"]
-  end
-
-  AGG -->|Consulta| bases
-  AGG -->|Grava ranking| SNAP[("S3: snapshot.json.gz")]
-```
-
-O EventBridge dispara a **Lambda Agregadora** a cada minuto. Ela lê os contadores do DynamoDB, capacidade da Databricks, tipos de instância e Spot Placement Scores da AWS EC2, publica um arquivo compactado `snapshot.json.gz` no S3 com o ranking pré-calculado.
+O EventBridge Scheduler dispara a **Lambda Agregadora** a cada minuto. Ela lê os contadores do DynamoDB, a capacidade dos pools de instâncias (Databricks/EMR), os tipos de máquina e os Spot Placement Scores da AWS EC2, publicando um snapshot compactado `snapshot.json.gz` no S3 com o ranking pré-calculado.
 
 ### 2.3 Fluxo 3: API de Seleção (Síncrono — ~5ms)
 
-```mermaid
-flowchart LR
-  JOB(["Job Spark"]) -->|GET /get-pools| API["Lambda API\n(RAM Cache 30s)"]
-  API -->|Resposta em ~5ms| RESULT["Pool Recomendado"]
-  SNAP[("S3: snapshot.json.gz")] -.->|Recarrega RAM| API
-```
-
-Ao receber requisições em `GET /get-pools`, a **Lambda API** utiliza o snapshot armazenado em memória (atualizado a cada 30s no máximo). Executa filtros e Thompson Sampling sem fazer NENHUMA chamada externa de rede ou banco no request.
+Ao receber requisições em `GET /get-pools`, a **Lambda API** carrega o snapshot do S3 para a memória RAM (com cache local de até 30s). Ela executa os filtros de busca e o Thompson Sampling em milissegundos sem realizar nenhuma chamada externa de rede ou banco durante a requisição.
 
 ### Por que pré-calcular?
 
 | Métrica | Calcular no Request (ex. Athena) | Pré-calcular (Arquitetura Atual) |
-|---|---|---|
+| --- | --- | --- |
 | Latência | Segundos | ~5 milissegundos |
 | Custo de Cálculo | Proporcional aos TBs lidos por request | Fixo (1 execução/min da Agregadora) |
 | Pico de 100 Jobs | 100 consultas pesadas concorrentes | Zero consultas adicionais |
@@ -124,7 +57,7 @@ O timestamp `finished_at` em UTC define a idade e peso de cada observação.
 ### 3.1 Classificação dos Eventos
 
 | Evento | Peso | Por quê |
-|---|---|---|
+| --- | --- | --- |
 | `SUCCESS` | Positivo (1.0) | Capacidade confirmada. |
 | `SPOT_INSTANCE_TERMINATION` | Negativo (1.0) | Queda de Spot (escassez). |
 | `TIMED_OUT` | Parcial (0.5) | Ambíguo: pode ser escassez ou job lento. |
@@ -135,7 +68,7 @@ O timestamp `finished_at` em UTC define a idade e peso de cada observação.
 O score final combina **Escassez da AZ** (mercado Spot) e **Adequação do Job ao Tipo** (recursos de máquina).
 
 | Fator | Fonte de Aprendizado | Meia-vida | Raciocínio |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Escassez da AZ** | Todos os jobs na AZ | 20 minutos | Dinâmico: o mercado Spot muda em minutos. |
 | **Adequação do Job** | Histórico por `job_id` | 14 dias | Estático: o perfil do código do job muda devagar. |
 
@@ -144,7 +77,7 @@ O score final combina **Escassez da AZ** (mercado Spot) e **Adequação do Job a
 **Fator de AZ (meia-vida = 20 min)** — 10 falhas às 14:00:
 
 | Momento | Tempo decorrido | Fator | Falhas ponderadas |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 14:00 | 0 min | `0.5^(0/20)` = 1.00 | **10.0 falhas** |
 | 14:20 | 20 min | `0.5^(20/20)` = 0.50 | **5.0 falhas** |
 | 15:00 | 60 min | `0.5^(60/20)` = 0.125 | **1.25 falhas** |
@@ -152,7 +85,7 @@ O score final combina **Escassez da AZ** (mercado Spot) e **Adequação do Job a
 **Fator de Job Fit (meia-vida = 14 dias)** — 5 falhas do job `etl-pedidos`:
 
 | Momento | Tempo decorrido | Fator | Falhas ponderadas |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Dia 0 | 0 dias | `0.5^(0/14)` = 1.00 | **5.0 falhas** |
 | Dia 7 | 7 dias | `0.5^(7/14)` = 0.71 | **3.54 falhas** |
 | Dia 14 | 14 dias | `0.5^(14/14)` = 0.50 | **2.5 falhas** |
@@ -162,7 +95,7 @@ O score final combina **Escassez da AZ** (mercado Spot) e **Adequação do Job a
 ### 3.3 Três Fontes de Dados
 
 | Pergunta | Fonte | Natureza | Frequência |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Esse pool costuma aguentar? | Histórico S3 / DynamoDB | Reativa (passado) | A cada evento |
 | Esse pool tem espaço agora? | API Databricks Instance Pools | Estado atual (presente) | 1 min |
 | Essa AZ vai aguentar? | AWS EC2 Spot Placement Score | Preditiva (futuro) | 5 min |
@@ -186,7 +119,7 @@ Para evitar que todos os jobs vão para o mesmo pool (efeito manada) e permitir 
 2. **Capacity Caps:** Limita a fatia máxima de tráfego de cada pool com base na capacidade livre informada pela Databricks. Se o melhor pool estiver cheio, o tráfego escorre para as alternativas.
 
 | Pool | Estimativa | Faixa | Amostras | Comportamento |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `pool-r6.xlarge-us-east-1a` | 0,94 | 0,90 a 0,97 | 210 | Vence quase sempre. |
 | `pool-r6.xlarge-us-east-1c` | 0,88 | 0,55 a 0,99 | 4 | Ganha eventualmente (exploração). |
 | `pool-r6.xlarge-us-east-1b` | 0,41 | 0,33 a 0,50 | 150 | Evitado com alta confiança. |
@@ -200,7 +133,7 @@ Para evitar que todos os jobs vão para o mesmo pool (efeito manada) e permitir 
 O serviço adota resiliência Serverless nativa (AWS Lambda, S3, SQS e DynamoDB multi-AZ) e uma política de **degradação graciosa** (nunca falha com 503 se houver alternativa):
 
 | Situação | Comportamento da API |
-|---|---|
+| --- | --- |
 | Snapshot indisponível | Retorna último snapshot da RAM com `stale: true`. |
 | Snapshot expirado (>5 min) | Responde normalmente, emite métrica e dispara alarme CloudWatch. |
 | Nenhum snapshot existente | Retorna lista estática de `FALLBACK_POOLS` com `degraded: true`. |
@@ -217,7 +150,7 @@ Desenvolvido em **Python 3.13** (Amazon Linux 2023, suporte no Lambda até jun/2
 ### Parâmetros de Query
 
 | Parâmetro | Tipo | Descrição |
-|---|---|---|
+| --- | --- | --- |
 | `job_id` | string | Identificador do job para ativar histórico específico. |
 | `instance_types` | string | Tipos de instância permitidos (separados por vírgula). |
 | `family` | string | Prefixo da família (ex: `r6`). |
@@ -264,7 +197,7 @@ Desenvolvido em **Python 3.13** (Amazon Linux 2023, suporte no Lambda até jun/2
 ### Códigos de Resposta HTTP
 
 | Código | Condição | Significado |
-|---|---|---|
+| --- | --- | --- |
 | **200 OK** | Sucesso | Pool recomendado com evidência (pode ter `stale: true`). |
 | **200 OK** | Fallback ativado | Respondido via lista estática de fallback (`degraded: true`). |
 | **404 Not Found** | Filtro sem resultado | Nenhum pool atende aos critérios informados. |
@@ -274,7 +207,7 @@ Desenvolvido em **Python 3.13** (Amazon Linux 2023, suporte no Lambda até jun/2
 ### 6.1 Framework Web & Execução
 
 | Camada | Escolha | Motivo | Alternativas Descartadas |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Framework** | **FastAPI** | Validação Pydantic e OpenAPI automático | Flask (sem validação), Django (pesado), Handler puro (sem docs/rotas) |
 | **Computação** | **AWS Lambda** | Escala a zero, sem custo ocioso e escala instantânea | Fargate/EC2 (custo fixo + autoscaling lento), EKS (complexidade excessiva) |
 | **Entrada HTTP** | **Function URL** | Zero custo por request, autenticação via IAM | API Gateway (cobrança por req), ALB (custo fixo por hora) |
@@ -282,7 +215,7 @@ Desenvolvido em **Python 3.13** (Amazon Linux 2023, suporte no Lambda até jun/2
 ### 6.2 Armazenamento & Banco de Dados
 
 | Componente | Escolha | Motivo | Alternativas Descartadas |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Contadores de Eventos** | **DynamoDB** | Escrita condicional (deduplicação SQS), incremento atômico e TTL nativo | PostgreSQL/Redis (custo fixo, conexões em Lambda), Athena (lento para escrita) |
 | **Snapshot de Ranking** | **S3 + Gzip** | Leitura massiva paralela, cache de RAM de 30s absorve latência | DynamoDB (teto de IOPS em partição única durante cold start) |
 
@@ -302,7 +235,7 @@ O gargalo do sistema não é volume de dados, mas **concorrência de leitura no 
 ### Cenário de Referência: 2.000 Jobs Simultâneos
 
 | Componente | Carga Estimada | Status de Resiliência |
-|---|---|---|
+| --- | --- | --- |
 | **Lambda API** | 2.000 req/s @ 5ms (~10 instâncias concorrentes) | Seguro (sem I/O no request) |
 | **Fila SQS & Ingestor** | 33 eventos/s (50k jobs/dia) | Seguro (processamento em batch) |
 | **Leitura do Snapshot** | 2.000 leituras simultâneas | Seguro (cache RAM 30s + S3 gzip) |
@@ -318,7 +251,7 @@ O gargalo do sistema não é volume de dados, mas **concorrência de leitura no 
 ## 8. Custo Estimado (~1,5M requests/mês)
 
 | Item | Arquitetura Atual (Serverless) | Alternativa Tradicional (Containers + ALB) |
-|---|---|---|
+| --- | --- | --- |
 | Computação API | < US$ 1,00 | > US$ 15,00 |
 | Entrada HTTP | US$ 0,00 (Function URL) | ~US$ 16,00 (ALB) |
 | Ingestão, Agregação & S3 | ~US$ 1,00 | ~US$ 1,00 |
@@ -383,6 +316,8 @@ infra/                       # Terraform
 
 tools/gen_events.py          # Gerador de eventos sintéticos
 tests/                       # unit, propriedades, contrato, integração, simulação, carga
+```
+
 * **Desenvolvimento Local:** Pode ser executado em **1 comando** via **Docker** (`docker compose up` ou `make demo`) ou nativamente via **uv** (`make dev`). Para simulação de serviços AWS completos (LocalStack), utilize `make dev-aws`.
 
 ---
@@ -392,7 +327,7 @@ tests/                       # unit, propriedades, contrato, integração, simul
 ### Estratégia de Testes
 
 | Nível | Escopo | Ferramenta |
-|---|---|---|
+| --- | --- | --- |
 | **Unitário** | Decaimento, Thompson Sampling, Filtros | `pytest` |
 | **Propriedade** | Invariantes (scores entre 0 e 1, filtros estritos) | `Hypothesis` |
 | **Integração** | DynamoDB, S3, deduplicação de batch SQS | `moto` |
@@ -459,7 +394,7 @@ Métricas publicadas via **CloudWatch EMF (Embedded Metric Format)** sem custo e
 ## Glossário
 
 | Termo | Conceito |
-|---|---|
+| --- | --- |
 | **Function URL** | Endpoint HTTPS direto na AWS Lambda sem custo de API Gateway. |
 | **TTL (Time-To-Live)** | Expiração automática de itens no DynamoDB para janela deslizante sem cron jobs. |
 | **Thompson Sampling** | Algoritmo bandit Bayesian que equilibra exploração (aprender pools novos) e exploração (usar os melhores). |
