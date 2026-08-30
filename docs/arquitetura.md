@@ -113,7 +113,11 @@ Ao receber requisições em `GET /get-pools`, a **Lambda API** utiliza o snapsho
 |---|---|---|
 | Latência | Segundos | ~5 milissegundos |
 | Custo de Cálculo | Proporcional aos TBs lidos por request | Fixo (1 execução/min da Agregadora) |
-| Pico de 100 Jobs | 100 cons## 3. Como o pool é escolhido
+| Pico de 100 Jobs | 100 consultas pesadas concorrentes | Zero consultas adicionais |
+
+---
+
+## 3. Como o pool é escolhido
 
 O timestamp `finished_at` em UTC define a idade e peso de cada observação.
 
