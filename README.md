@@ -1,45 +1,38 @@
-# spark-pool-selection-service
+# Spark Pool Selection Service
 
-API REST que responde, a qualquer hora do dia, em qual pool de instâncias spot um Spark
-job tem mais chance de rodar até o fim.
+> Service REST de alta performance para recomendação preditiva de **Spark Instance Pools** em instâncias Spot da AWS, prevenindo quedas por escassez de capacidade.
 
-Job que sobe em uma AZ sem capacidade spot morre no meio da execução. Ninguém publica
-quanta capacidade existe em cada pool, então o serviço junta o que dá para saber: o
-histórico de término dos jobs, a capacidade atual dos pools e a previsão de spot da AWS.
+---
 
-## Comece por aqui
+## ⚡ Quickstart (1 Comando)
 
+Você pode subir o serviço completo (API + Geração de Eventos + Pipeline de Agregação) em **1 comando**:
+
+### Opção 1: Via Docker (Recomendado se não tiver `uv`)
+```bash
+docker compose up
+# Ou via Makefile:
+make demo
+```
+
+### Opção 2: Via `uv` (Nativo em Python)
 ```bash
 make dev
 ```
+*Requisito: [uv](https://docs.astral.sh/uv/) instalado (o `uv` gerencia o Python 3.13 e as dependências automaticamente).*
 
-Um comando, sem Docker. Cria o ambiente virtual isolado com `uv`, gera eventos sintéticos,
-roda o pipeline de verdade sobre eles, publica um snapshot e liga a API em
-<http://localhost:5050/get-pools>, com a documentação interativa em
-<http://localhost:5050/docs>.
+A API estará disponível em `http://localhost:5050/get-pools`, com documentação Swagger interativa em `http://localhost:5050/docs`.
 
-O único pré-requisito é o [uv](https://docs.astral.sh/uv/). Ele instala o próprio Python
-3.13, então não importa qual versão está na máquina.
+---
 
-Quem preferir container, ou não quiser nem o `uv`:
+## 📌 Testando o Endpoint
 
 ```bash
-docker compose up
+curl 'http://localhost:5050/get-pools?job_id=etl-vendas&profile=memory'
 ```
+*(Alias `/get-pool` também suportado).*
 
-E quem quiser exercitar os adapters de AWS contra o LocalStack, o que precisa de Docker:
-
-```bash
-make dev-aws
-```
-
-## O endpoint
-
-```bash
-curl 'localhost:5050/get-pools?job_id=etl-vendas&profile=memory'
-```
-
-O enunciado cita os dois nomes, então `/get-pool` também responde, como alias.
+### Exemplo de Resposta JSON
 
 ```json
 {
@@ -57,81 +50,52 @@ O enunciado cita os dois nomes, então `/get-pool` também responde, como alias.
 }
 ```
 
-Todos os parâmetros são opcionais e combináveis: `job_id`, `instance_types`, `family`,
-`profile`, `availability_zones`, `exclude_pools`, `min_samples`, `strategy`,
-`alternatives`, `seed`. A referência completa está no OpenAPI em `/docs` e no
-[contrato](docs/arquitetura.md#5-contrato-do-endpoint).
+Parâmetros suportados: `job_id`, `instance_types`, `family`, `profile`, `availability_zones`, `exclude_pools`, `min_samples`, `strategy`, `alternatives`, `seed`. Veja o [Contrato da API](docs/arquitetura.md#5-contrato-da-api-get-get-pools).
 
-## Como funciona
+---
 
-Dois caminhos que nunca se cruzam em tempo de request. Um ranking pré-calculado uma vez
-por minuto, e uma API que só consulta o resultado, já em memória. Na maior parte das
-chamadas nenhuma requisição de rede acontece.
+## 🧠 Como Funciona
 
-O score de cada pool combina duas faixas de incerteza, e a escolha é um sorteio dentro
-delas, não o máximo. Isso resolve dois problemas: um pool que parou de ser recomendado
-ainda gera evidência de vez em quando, e um pool com 1 sucesso em 1 tentativa não passa na
-frente de um com 200 em 210.
+1. **Desperdício Zero no Request (Latência < 5ms):** Ranking é pré-calculado a cada 1 minuto por um Worker assíncrono e armazenado no S3 em Gzip. A API de leitura apenas lê o snapshot da memória RAM.
+2. **Aprendizado Estatístico Duplo (Thompson Sampling):**
+   - **Escassez da AZ (Meia-vida de 20 min):** Adaptação ultra-rápida a quedas no mercado Spot da AWS.
+3. **Prevenção de Efeito Manada (Capacity Caps):** Aplica limites dinâmicos de alocação de tráfego baseados na capacidade livre real dos pools de instâncias (integrando com APIs de plataformas como Databricks ou telemetria de clusters EMR/Spark autogeridos).
 
-Sortear sozinho não segura um pico, só o suaviza, porque a chance de um pool vencer não
-sabe quantas vagas ele tem. Por isso a fatia de cada candidato tem teto derivado da
-capacidade livre: um pool com duas vagas nunca recebe a enxurrada que um com sessenta
-receberia, e o excedente escorre para o próximo melhor.
+---
 
-O detalhamento, com as alternativas descartadas em cada decisão, está na
-[arquitetura](docs/arquitetura.md).
+## 🛠️ Comandos Principais
 
-## Documentação
-
-- [Arquitetura](docs/arquitetura.md): o desenho, cada escolha de ferramenta com o que foi
-  descartado, o algoritmo de seleção e os limites conhecidos.
-- [Requisitos](docs/requisitos.md): o que o serviço precisa fazer, separado entre pedido,
-  derivado e premissa assumida, com rastreabilidade até a arquitetura.
-- [Infra](infra/README.md): o que exige atenção antes do primeiro pico.
-
-## Comandos
-
-| Comando | O que faz |
+| Comando | Descrição |
 |---|---|
-| `make dev` | Ambiente completo em um comando, sem Docker |
-| `make dev-aws` | O mesmo fluxo contra o LocalStack |
-| `make test` | Suíte inteira com o gate de cobertura de 85% no domínio |
-| `make test-fast` | Só domínio, propriedades e contrato. Roda em milissegundos, sem simular AWS. |
-| `make check` | Tudo que o CI roda: lint, tipos, testes e auditoria de dependência |
-| `make load` | Pico de 2.000 requests simultâneos com k6 |
-| `make tf-validate` | Formata e valida o Terraform |
-| `make package` | Monta o zip de deploy |
-| `make demo` | Sobe tudo em container |
+| `make demo` / `docker compose up` | Sobe ambiente completo em 1 comando via Docker |
+| `make dev` | Sobe ambiente local via `uv` sem necessidade de Docker |
+| `make dev-aws` | Executa fluxo completo integrado ao LocalStack |
+| `make test` | Roda toda a suíte de testes (gate de 85% de cobertura) |
+| `make test-fast` | Testes rápidos de domínio/contrato (sem mocks AWS, em ms) |
+| `make check` | Executa linter (`ruff`), checagem de tipos (`mypy`) e auditoria |
+| `make load` | Teste de carga simulando pico de 2.000 req/s via `k6` |
+| `make package` | Gera o pacote ZIP otimizado para deploy Serverless na AWS Lambda |
 
-`make help` lista o resto.
+---
 
-## Estrutura
+## 📂 Estrutura do Repositório
 
 ```
 src/pool_selection/
-├── domain/          # Python puro: sem boto3, sem FastAPI, sem AWS
-├── ports/           # os contratos com o mundo externo
-├── adapters/        # dynamodb, s3, databricks, ec2, memória
-└── entrypoints/     # api, ingestor, aggregator
-infra/               # Terraform
-tools/               # gerador de eventos e seed do ambiente local
-tests/               # unit, propriedades, integração, contrato, simulação, carga
+├── domain/          # Python puro: regras de negócio, Thompson Sampling, sem AWS/FastAPI
+├── ports/           # Interfaces e contratos abstratos
+├── adapters/        # Implementações concretas (DynamoDB, S3, Databricks, EC2)
+└── entrypoints/     # Lambda Handlers (API REST, Ingestor SQS, Agregador EventBridge)
+infra/               # Módulos Terraform (IaC Serverless completo)
+tools/               # Geradores de eventos sintéticos e scripts dev
+tests/               # Unitários, Propriedades (Hypothesis), Integração (moto), Carga (k6)
 ```
 
-O miolo estatístico não importa nada de AWS, então a maior parte da suíte roda em
-milissegundos e sem simular nada. As bordas ficam finas o bastante para poucos testes de
-integração.
+---
 
-## Testes
+## 📄 Documentação Técnica
 
-| Nível | O que cobre |
-|---|---|
-| Unitário | Classificação de evento, decaimento, os dois fatores, sorteio e filtros |
-| Propriedade | Invariantes que exemplo não pega, com Hypothesis |
-| Integração | Adapters contra AWS simulada em processo, com moto |
-| Contrato | O endpoint inteiro, incluindo validação de parâmetro e formato da resposta |
-| Simulação | Derruba a disponibilidade de uma AZ e verifica que a recomendação migra |
-| Carga | Pico de 2.000 requests simultâneos, com k6 |
+- [📐 Arquitetura Completa](docs/arquitetura.md): Decisões de design, modelos de decaimento, resiliência e comparação de alternativas.
+- [📋 Requisitos e Premissas](docs/requisitos.md): Mapeamento de requisitos funcionais e não-funcionais.
+- [🚀 Guia de Infraestrutura](infra/README.md): Detalhes de provisionamento Terraform e pipeline CI/CD Serverless.
 
-O teste de simulação é o único que prova que o algoritmo funciona. Os outros verificam
-peças.

@@ -1,47 +1,72 @@
-# Arquitetura do seletor de pools Spark
+# Arquitetura do Seletor de Pools Spark
 
-Uma API que responde, a qualquer hora, em qual pool de instâncias spot um job Spark tem
-mais chance de rodar até o fim. Este documento explica o desenho, o que foi escolhido e o
-que foi descartado.
+API para recomendação de instâncias Spot otimizadas para jobs Spark, combinando histórico de término de jobs, capacidade da Databricks e Spot Placement Score da AWS.
 
-Status: implementado. A rastreabilidade requisito a requisito está em
-[requisitos.md](requisitos.md), e o que ficou de fora está na [seção 12](#12-limites-conhecidos).
+Status: **Implementado**. Rastreabilidade completa em [requisitos.md](requisitos.md) e limitações na [Seção 12](#12-limites-conhecidos).
 
 ---
 
 ## 1. O que o serviço faz
 
-Instância spot é capacidade ociosa da AWS vendida barato, que pode ser retomada a
-qualquer momento. A disponibilidade muda por zona (AZ), por tipo de instância e por hora
-do dia. Quando um pool fica sem capacidade, os jobs que estão nele morrem.
+Instâncias Spot oferecem até 90% de desconto na AWS, mas podem ser revogadas a qualquer momento (`SPOT_INSTANCE_TERMINATION`), matando jobs em execução. A AWS publica apenas uma probabilidade ampla por AZ; o serviço combina essa informação com o histórico recente de términos por pool e dados em tempo real da Databricks.
 
-Ninguém publica quanta capacidade existe em cada pool. A AWS publica algo mais grosso, uma
-probabilidade por AZ, e os eventos de job dão o que falta: se jobs no
-`pool-r6.xlarge-us-east-1c` começaram a morrer com `SPOT_INSTANCE_TERMINATION` nos últimos
-vinte minutos, aquela AZ está apertada agora, e isso a AWS não conta. O serviço junta as
-duas coisas.
+### 1.1 Economia de Nuvem (Spot vs DBU)
 
-É um pipeline pequeno de três camadas: ingestão dos eventos que caem no S3, agregação por
-pool, e uma API que serve o resultado. O que muda tudo é a latência exigida na ponta. Um
-dashboard aceita cinco segundos. Um job que está subindo, não.
-
-### 1.1 Contexto e Economia de Nuvem: Entendendo o valor (Spot vs DBU)
-
-Para contextualizar quem é leigo no modelo financeiro de plataformas de dados como Databricks na AWS ou Azure:
-
-* **Como a cobrança funciona:** O custo de rodar um job Spark é a soma de **Software (DBU da Databricks)** + **Hardware (EC2 da AWS ou VM da Azure)**. O valor do DBU (licença) é fixo, mas o hardware em instâncias **Spot** custa entre **70% e 90% mais barato** que o preço normal (On-Demand).
-* **O risco do Spot:** As instâncias Spot utilizam a capacidade ociosa dos datacenters. Se a demanda na nuvem aumentar, a AWS/Azure retoma essas máquinas com um aviso de apenas 2 minutos (`SPOT_INSTANCE_TERMINATION`), fazendo o job Spark morrer.
-* **Onde o serviço gera valor:**
-  1. **Economia massiva de infraestrutura:** Garante que a maior parte dos jobs consiga rodar em Spot com desconto.
-  2. **Evita desperdício de licenças (DBU):** Se um job de 45 minutos morre no minuto 40 por falta de capacidade, o tempo já rodado é perdido. A empresa paga o DBU e a infraestrutura daquele tempo jogado no lixo e precisa reexecutar o job. O serviço seleciona o pool com a menor chance de queda, garantindo que o job vá até o fim.
+* **Custo do Spark:** Licença de Software (DBU Databricks) + Computação (EC2 AWS). O DBU tem preço fixo; instâncias Spot reduzem o custo de EC2 em **70% a 90%**.
+* **Evita Desperdício de DBU:** Se um job de 45 minutos é revogado no minuto 40, todo o tempo de DBU e EC2 é jogado fora.
+* **Geração de Valor:** Maximiza o uso de Spot com segurança e minimiza a perda de progresso e licenças DBU.
 
 ---
 
 ## 2. Como funciona
 
-A arquitetura é estruturada em **três fluxos independentes** que se dividem entre o processamento assíncrono em background (Escrita) e a consulta em tempo real (Leitura). O caminho de escrita e o de leitura **nunca se cruzam em tempo de requisição**, garantindo resposta em milissegundos (< 5ms) e baixíssimo custo por query.
+A arquitetura separa o processamento em background (Escrita) da consulta em tempo real (Leitura). O caminho de leitura **não faz chamadas de rede externas**, garantindo latência **< 5ms**.
 
-### 2.1 Fluxo 1: Ingestão de Eventos (Reativo por evento quando o job termina)
+### 2.0 Visão geral
+
+```mermaid
+flowchart TD
+    subgraph Ingestao ["1 - Ingestao de Eventos"]
+        S3Ev["S3 Events Bucket\neventos brutos de jobs"]
+        SQS["Fila SQS\nbuffer + controle"]
+        Ing["Lambda Ingestora\nhandler.py"]
+        DDB[("DynamoDB\nCounters Table")]
+        DLQ["Fila DLQ\nmensagens mortas"]
+
+        S3Ev -->|s3:ObjectCreated| SQS
+        SQS -->|Lote 1000 msgs / 20s| Ing
+        Ing -->|UpdateItem / PutItem| DDB
+        SQS -.->|Falha 5x| DLQ
+    end
+
+    subgraph Agregacao ["2 - Agregacao - cron 1 min"]
+        Sched["EventBridge Scheduler"]
+        Agg["Lambda Agregadora\nhandler.py"]
+        EC2["AWS EC2 API"]
+        DBX["Databricks API"]
+        S3Snap["S3 Snapshot Bucket\npools.json.gz"]
+
+        Sched -->|rate 1 min| Agg
+        Agg -->|Query counters| DDB
+        Agg -->|GetSpotPlacementScores| EC2
+        Agg -->|ListInstancePools| DBX
+        Agg -->|PutObject| S3Snap
+    end
+
+    subgraph API ["3 - API de Selecao"]
+        Client["Cliente / Spark Job"]
+        APIGW["Lambda Function URL"]
+        APILam["Lambda API\nFastAPI + handler.py"]
+
+        Client -->|HTTP + SigV4| APIGW
+        APIGW --> APILam
+        APILam -->|GetObject - cache 30s| S3Snap
+    end
+```
+
+Os três componentes são Lambdas isoladas via IAM. Compartilham apenas o DynamoDB (contadores) e o S3 (snapshot).
+
+### 2.1 Fluxo 1: Ingestão de Eventos (Assíncrono)
 
 ```mermaid
 flowchart LR
@@ -51,303 +76,156 @@ flowchart LR
   ING -->|soma contadores| CNT[("DynamoDB\n(contadores por pool/minuto)")]
 ```
 
-Quando um job termina, a plataforma escreve uma linha de log no bucket S3 de eventos. A notificação `ObjectCreated` envia uma mensagem para a fila SQS, que entrega lotes para a **Lambda Ingestora**. Ela classifica cada evento e soma os contadores de falhas/sucessos no DynamoDB por pool e por minuto.
+Ao término de um job, o log cai no S3 e notifica o SQS. A **Lambda Ingestora** consome em lotes (até 1.000 msgs ou 20s), classifica os eventos e incrementa contadores no DynamoDB agrupados por minuto e pool.
 
-### 2.2 Fluxo 2: Agregação & Cálculo do Ranking (Agendado a cada 1 minuto)
+### 2.2 Fluxo 2: Agregação & Ranking (Cron 1 min)
 
 ```mermaid
 flowchart TD
-  SCH{{"⏰ EventBridge Scheduler\n(Dispara sozinho a cada 1 min)"}}
-  
-  SCH -->|1. Invoca a cada 60s| AGG["Lambda Agregadora"]
+  SCH{{"⏰ EventBridge Scheduler\n(Dispara a cada 1 min)"}}
+  SCH -->|Invoca| AGG["Lambda Agregadora"]
 
-  subgraph bases["Bases e Fontes Consultadas"]
+  subgraph bases["Fontes Consultadas"]
     direction LR
     CNT[("DynamoDB\n(Contadores)")] ~~~ DBX["Databricks API\n(Capacidade)"] ~~~ SPS["EC2 Spot Scores\n(Previsão AZ)"] ~~~ CATALOG["EC2 Catalog\n(Tipos)"]
   end
 
-  AGG -->|2. Consulta| bases
-  AGG -->|3. Grava o ranking| SNAP[("S3: snapshot.json.gz\n(Ranking pré-calculado)")]
+  AGG -->|Consulta| bases
+  AGG -->|Grava ranking| SNAP[("S3: snapshot.json.gz")]
 ```
 
-O EventBridge Scheduler invoca a **Lambda Agregadora** a cada 1 minuto. Ela lê os contadores acumulados no DynamoDB, busca a capacidade atual dos pools na Databricks e atualiza o catálogo de tipos e a previsão de spot na EC2 da AWS. Então, calcula o score estatístico de cada pool e grava um único arquivo comprimido (`snapshot.json.gz`) no S3 contendo o ranking inteiro pré-calculado.
+O EventBridge dispara a **Lambda Agregadora** a cada minuto. Ela lê os contadores do DynamoDB, capacidade da Databricks, tipos de instância e Spot Placement Scores da AWS EC2, publica um arquivo compactado `snapshot.json.gz` no S3 com o ranking pré-calculado.
 
-Em produção, a agregadora resolve o token da Databricks no Secrets Manager. A consulta de tipos de instância é renovada 1x ao dia e a previsão de placement a cada 5 minutos; ambas são preservadas no snapshot entre as execuções. Se alguma fonte externa falhar, a rodada continua com o último valor disponível.
-
-### 2.3 Fluxo 3: Consulta da API / Recomendação (Síncrono — Caminho Crítico ~5ms)
+### 2.3 Fluxo 3: API de Seleção (Síncrono — ~5ms)
 
 ```mermaid
 flowchart LR
-  JOB(["Job Spark"]) -->|1. GET /get-pool| API["Lambda API\n(Snapshot em memória RAM)"]
-  API -->|2. Resposta em ~5ms| RESULT["Pool Recomendado"]
-  SNAP[("S3: snapshot.json.gz")] -.->|Recarrega RAM a cada 30s| API
+  JOB(["Job Spark"]) -->|GET /get-pools| API["Lambda API\n(RAM Cache 30s)"]
+  API -->|Resposta em ~5ms| RESULT["Pool Recomendado"]
+  SNAP[("S3: snapshot.json.gz")] -.->|Recarrega RAM| API
 ```
 
-Quando um job Spark vai iniciar e consulta o endpoint (`GET /get-pool`), a **Lambda API** já possui esse arquivo de ranking carregado na sua memória RAM local (recarregado do S3 no máximo a cada 30 segundos). Ela aplica os filtros solicitados (`job_id`, `profile`, `availability_zones`), executa o sorteio (Thompson Sampling) e responde em cerca de 5ms. **Nenhuma chamada de rede externa ou consulta a banco de dados acontece durante a requisição.**
+Ao receber requisições em `GET /get-pools`, a **Lambda API** utiliza o snapshot armazenado em memória (atualizado a cada 30s no máximo). Executa filtros e Thompson Sampling sem fazer NENHUMA chamada externa de rede ou banco no request.
 
-### Por que pré-calcular
+### Por que pré-calcular?
 
-A alternativa intuitiva é consultar o S3 na hora, com Athena. Funciona e é o desenho
-errado.
-
-| | Calcular no request | Pré-calcular |
+| Métrica | Calcular no Request (ex. Athena) | Pré-calcular (Arquitetura Atual) |
 |---|---|---|
-| Latência | segundos | milissegundos |
-| Custo do cálculo | por TB lido, cresce com o tráfego | fixo, uma execução por minuto |
-| 100 jobs no pico | 100 queries iguais | zero queries a mais |
+| Latência | Segundos | ~5 milissegundos |
+| Custo de Cálculo | Proporcional aos TBs lidos por request | Fixo (1 execução/min da Agregadora) |
+| Pico de 100 Jobs | 100 cons## 3. Como o pool é escolhido
 
-O que torna isso possível é o tamanho do resultado. São algumas dezenas de pools com
-quatro números cada. O ranking inteiro cabe em poucos kilobytes, então cabe na memória da
-API.
+O timestamp `finished_at` em UTC define a idade e peso de cada observação.
 
----
-
-## 3. Como o pool é escolhido
-
-O `finished_at` do evento é o relógio do modelo: é dele que sai a idade de cada
-observação e, portanto, o peso dela. Vem em UTC no formato ISO e é normalizado na
-ingestão.
-
-### Nem toda falha fala sobre o pool
+### 3.1 Classificação dos Eventos
 
 | Evento | Peso | Por quê |
 |---|---|---|
-| `SUCCESS` | positivo | Havia capacidade. |
-| `SPOT_INSTANCE_TERMINATION` | negativo | É o que queremos evitar. |
-| `TIMED_OUT` | parcial | Ambíguo: pode ser escassez, pode ser job lento. |
-| `SPARK_EXECUTION_ERROR` | descartado | Bug do job. Penalizaria pools só porque times com código instável os usam. |
+| `SUCCESS` | Positivo (1.0) | Capacidade confirmada. |
+| `SPOT_INSTANCE_TERMINATION` | Negativo (1.0) | Queda de Spot (escassez). |
+| `TIMED_OUT` | Parcial (0.5) | Ambíguo: pode ser escassez ou job lento. |
+| `SPARK_EXECUTION_ERROR` | Descartado | Bug no código do job, não penaliza o pool. |
 
-### Dois fatores, não um
+### 3.2 Dois Fatores Independentes
 
-O `pool_id` carrega duas informações independentes. `pool-r6.xlarge-us-east-1c` diz onde
-(a AZ) e o quê (o tipo de instância). São perguntas diferentes: a AZ determina escassez,
-que é sobre o mercado spot e não tem relação com o job; o tipo determina se o job cabe
-ali, que é sobre o job e não sobre o mercado.
+O score final combina **Escassez da AZ** (mercado Spot) e **Adequação do Job ao Tipo** (recursos de máquina).
 
-O score final multiplica os dois, e cada um aprende de uma fonte diferente:
-
-| Fator | Aprende com | Meia-vida | Por quê |
+| Fator | Fonte de Aprendizado | Meia-vida | Raciocínio |
 |---|---|---|---|
-| Escassez da AZ | todos os jobs | 20 minutos | Muita evidência, e o mercado muda em horas. |
-| Adequação do job ao tipo | histórico daquele `job_id` | 2 semanas | Pouca evidência, mas só precisa detectar diferença grosseira. É propriedade do código do job, não muda em horas. |
+| **Escassez da AZ** | Todos os jobs na AZ | 20 minutos | Dinâmico: o mercado Spot muda em minutos. |
+| **Adequação do Job** | Histórico por `job_id` | 14 dias | Estático: o perfil do código do job muda devagar. |
 
-As meias-vidas diferentes são essenciais. Com 20 minutos nos dois, um job diário
-esqueceria de si mesmo entre uma execução e outra e nunca aprenderia nada sobre si.
+#### Exemplo Numérico do Decaimento Exponencial (`fator = 0.5 ^ (tempo / meia_vida)`)
 
-Isso responde à pergunta do job pesado sem precisar de nenhum campo novo no evento. Não
-sabemos quantos executores o job usou nem quanto tempo levou, e não precisamos: se
-`meu-etl-pesado` sobrevive em `r6.4xlarge` e morre em `r6.xlarge`, o histórico dele conta
-isso direto, sem explicar o mecanismo.
+**Fator de AZ (meia-vida = 20 min)** — 10 falhas às 14:00:
 
-### Três fontes, não uma
+| Momento | Tempo decorrido | Fator | Falhas ponderadas |
+|---|---|---|---|
+| 14:00 | 0 min | `0.5^(0/20)` = 1.00 | **10.0 falhas** |
+| 14:20 | 20 min | `0.5^(20/20)` = 0.50 | **5.0 falhas** |
+| 15:00 | 60 min | `0.5^(60/20)` = 0.125 | **1.25 falhas** |
 
-O histórico de falhas responde "esse pool costuma aguentar?", e só isso. Ele não sabe se o
-pool tem espaço neste instante, nem se a AZ vai apertar na próxima hora. São três
-perguntas, e as outras duas têm resposta direta, sem precisar inferir de nada:
+**Fator de Job Fit (meia-vida = 14 dias)** — 5 falhas do job `etl-pedidos`:
 
-| Pergunta | Fonte | Natureza |
-|---|---|---|
-| Esse pool costuma aguentar? | Eventos no S3 | Reativa, por pool |
-| Esse pool tem espaço agora? | API de pools da Databricks | Estado atual, por pool |
-| Essa AZ vai aguentar? | Spot placement score da AWS | Preditiva, por AZ e perfil |
+| Momento | Tempo decorrido | Fator | Falhas ponderadas |
+|---|---|---|---|
+| Dia 0 | 0 dias | `0.5^(0/14)` = 1.00 | **5.0 falhas** |
+| Dia 7 | 7 dias | `0.5^(7/14)` = 0.71 | **3.54 falhas** |
+| Dia 14 | 14 dias | `0.5^(14/14)` = 0.50 | **2.5 falhas** |
 
-As três entram na agregadora, fora do caminho de request. Nenhuma delas é chamada quando
-um job pergunta.
+*Nota: Se usassem a mesma meia-vida de 20 min, um job diário esqueceria seu histórico em 24h (`0.5^72 ≈ 0`).*
 
-#### Capacidade agora
+### 3.3 Três Fontes de Dados
 
-O termo "pool de instâncias" é vocabulário da Databricks, e a API de instance pools expõe
-o estado atual de cada pool, numa consulta por minuto:
+| Pergunta | Fonte | Natureza | Frequência |
+|---|---|---|---|
+| Esse pool costuma aguentar? | Histórico S3 / DynamoDB | Reativa (passado) | A cada evento |
+| Esse pool tem espaço agora? | API Databricks Instance Pools | Estado atual (presente) | 1 min |
+| Essa AZ vai aguentar? | AWS EC2 Spot Placement Score | Preditiva (futuro) | 5 min |
 
-| Campo | Uso no modelo |
-|---|---|
-| `state` | Pool `STOPPED` ou `DELETED` sai da lista de candidatos. Sem isso, o serviço pode recomendar um pool que não existe mais, porque o histórico de eventos não sabe que ele morreu. |
-| `max_capacity` menos `used_count` e `pending_used_count` | Espaço livre agora. Um pool cheio não deve ser recomendado por melhor que seja o histórico dele. O campo é opcional na Databricks: pool sem teto declarado entra sem esse ajuste. |
-| `idle_count` | Instâncias já quentes. Elas não precisam ser adquiridas no mercado spot, então não correm o risco que estamos modelando. Pool com folga ociosa é mais seguro do que o histórico sugere. |
-| `aws_attributes.availability` | `SPOT_WITH_FALLBACK` cai para on-demand quando falta spot, então quase não falha por escassez. O perfil de risco é outro e o score precisa refletir isso. |
-| `node_type_id` e `zone_id` | Tipo e AZ de forma autoritativa, em vez de parseados do nome do pool. |
+#### Detalhes das Fontes Externas
 
-A lista de candidatos passa a vir da API, não do histórico. Pool novo, que nunca apareceu
-em nenhum evento, hoje seria invisível.
+* **Databricks API:** Fornece `state` (filtra pools parados), `free_slots` (espaço livre), `idle_count` (instâncias quentes, sem risco spot) e `SPOT_WITH_FALLBACK` (bônus configurável no score).
+* **AWS Spot Placement Score (`GetSpotPlacementScores`):** Avalia disponibilidade de 1 a 10 por AZ e perfil.
+  * *Restrições da AWS:* Exige consulta por perfil (mínimo 3 tipos de máquina), usa p90 de capacidade e atualiza a cada 5 min para evitar throttling da AWS.
 
-Um pool `SPOT_WITH_FALLBACK` é mais seguro e mais caro, porque a economia do spot some
-justamente quando ele é acionado. O bônus de score dele é configurável e nasce pequeno:
-o serviço existe para reduzir falha sem jogar fora a razão de usar spot.
+### 3.4 Perfil Dinâmico de Instâncias
 
-Se o ambiente não for Databricks, essa fonte não existe e o serviço volta a operar só com
-o histórico, que é o desenho original. O modelo trata a capacidade como fator opcional
-justamente por isso.
+Em vez de tabelas fixas, a Agregadora executa `DescribeInstanceTypes` 1x/dia para calcular a razão **Memória por vCPU** (igual ao Vantage), classificando em `memory`, `compute`, `general` ou `storage`. Novas famílias da AWS são suportadas sem novo deploy.
 
-#### O sinal que chega antes da falha
+### 3.5 Thompson Sampling & Capacity Caps
 
-Histórico e capacidade são as duas fontes olhando para trás e para agora. Falta olhar
-para frente, e essa é a diferença entre um serviço que reage e um que antecipa: sem
-previsão, a primeira notícia de que uma AZ apertou é um job de alguém morrendo nela.
+Para evitar que todos os jobs vão para o mesmo pool (efeito manada) e permitir exploração de pools novos:
 
-A AWS publica exatamente esse número. `GetSpotPlacementScores` devolve, de 1 a 10, quão
-provável é conseguir uma quantidade de capacidade spot em cada AZ agora, e com
-`SingleAvailabilityZone=true` a resposta vem por AZ, que é a granularidade do problema.
-Não custa nada.
+1. **Thompson Sampling:** Sorteia um ponto dentro da distribuição Beta (`Beta(alpha, beta)`) de cada pool. Pools com poucas amostras têm faixas largas e podem ganhar eventualmente.
+   * *Zero Scipy:* Distribuição Beta implementada em Python puro (~80 linhas via fração continuada de Lentz e inversa por bisseção), reduzindo ~50MB no pacote da Lambda e 2s no cold start.
+2. **Capacity Caps:** Limita a fatia máxima de tráfego de cada pool com base na capacidade livre informada pela Databricks. Se o melhor pool estiver cheio, o tráfego escorre para as alternativas.
 
-Três restrições da API decidem como ela é usada, e ignorar qualquer uma delas faz o sinal
-chegar errado em vez de não chegar:
-
-| Restrição | O que ela força no desenho |
-|---|---|
-| Menos de três tipos de instância diferentes devolve score baixo por definição | Um pool tem um tipo só, então pool nunca pode ser pontuado direto. A consulta é por perfil, com os tipos daquele perfil na região, e o resultado alimenta o fator de AZ. |
-| O score depende da capacidade que você pergunta: 10 para 10 instâncias não é 10 para 1.000 | A capacidade alvo é o p90 de instâncias que os pools daquele perfil de fato usam, tirado dos dados da Databricks, e não uma constante escolhida no chute. |
-| A AWS pode barrar configurações de consulta novas dentro de 24 horas se o padrão fugir do uso pretendido; repetir configuração já usada é livre | O conjunto de consultas é fixo e pequeno, uma por perfil, e o refresh é a cada 5 minutos em vez de a cada minuto. Capacidade spot muda em horas, então 5 minutos não perde nada e mantém o uso dentro do previsto. |
-
-O encaixe no modelo já existia. O fator de AZ sempre foi "sobre o mercado, não sobre o
-job", e o placement score é exatamente uma medida de mercado por AZ. Ele entra como prior
-desse fator: enquanto não há falha recente, a previsão manda; quando o histórico começa a
-contradizer o score, a evidência observada ganha, porque ela é sobre os pools reais e o
-score é sobre a região.
-
-O que a AWS não promete importa tanto quanto o que ela promete. O score é recomendação,
-não garantia de capacidade, e um score alto por AZ assume alocação `capacity-optimized`
-concentrada em uma AZ, que é como um pool funciona de qualquer jeito. Se a chamada falhar, a
-agregadora mantém a previsão anterior e o `age_seconds` do `az_outlook` cresce, o que
-denuncia o problema na própria resposta. Só na primeira execução, quando não há previsão
-nenhuma, o fator nasce neutro e o serviço é puramente reativo.
-
-### De onde sai o perfil de um tipo de instância
-
-O filtro `profile` precisa saber que `r6.xlarge` é memória e `c6.xlarge` é CPU. Uma
-tabela fixa no código resolveria e envelheceria: cada família nova da AWS viraria um
-deploy.
-
-Em vez disso, a agregadora consulta `DescribeInstanceTypes` uma vez por dia e classifica
-pela razão memória por vCPU, com armazenamento local como desempate. É a mesma conta que
-o [Vantage](https://instances.vantage.sh/) mostra, feita a partir da fonte primária, e
-funciona para família que ainda não existe. Tipo que a API não reconhece fica com perfil
-desconhecido e continua acessível por `instance_types` e `family`, em vez de sumir do
-catálogo. O resultado entra no snapshot, então o
-caminho de request continua sem I/O.
-
-### Por que sortear em vez de pegar o melhor
-
-Cada pool vira uma faixa, não um número. O centro é a taxa de sucesso estimada e a
-largura é a incerteza, que depende de quanta evidência existe. A cada request o serviço
-sorteia um ponto dentro da faixa de cada candidato e devolve o maior. É Thompson
-Sampling.
-
-| Pool | Estimativa | Faixa | Amostras | No sorteio |
+| Pool | Estimativa | Faixa | Amostras | Comportamento |
 |---|---|---|---|---|
 | `pool-r6.xlarge-us-east-1a` | 0,94 | 0,90 a 0,97 | 210 | Vence quase sempre. |
-| `pool-r6.xlarge-us-east-1c` | 0,88 | 0,55 a 0,99 | 4 | Às vezes ganha, o que o traz de volta. |
-| `pool-r6.xlarge-us-east-1b` | 0,41 | 0,33 a 0,50 | 150 | Evitado com confiança. |
+| `pool-r6.xlarge-us-east-1c` | 0,88 | 0,55 a 0,99 | 4 | Ganha eventualmente (exploração). |
+| `pool-r6.xlarge-us-east-1b` | 0,41 | 0,33 a 0,50 | 150 | Evitado com alta confiança. |
 
-Três problemas caem juntos:
+* **Job Novo:** Herda o prior médio do perfil declarado (`profile=memory`). Com 3 falhas, o score cai de 0.9 para ~0.36.
 
-- Pool que parou de ser recomendado nunca mais gera dado e morreria para sempre no
-  ranking. A recomendação de hoje determina os dados de amanhã, e a faixa larga quebra
-  esse ciclo.
-- Um pico de duzentos jobs não vai todo para o mesmo pool, porque cada request sorteia de
-  novo. Espalhamento sem estado compartilhado e sem escrita no caminho crítico.
-- Um pool com 1 sucesso em 1 tentativa não vence um com 200 em 210.
+---
 
-O preço aparece em dois lugares. A resposta deixa de ser reprodutível, então a
-aleatoriedade é injetada, recebe semente fixa em teste, e o endpoint aceita
-`strategy=greedy` para quem precisar de resposta determinística. E o custo de explorar cai
-inteiro no dono do job que foi cobaia, nunca distribuído, então o endpoint aceita
-`min_samples` para job crítico exigir evidência e a resposta expõe de onde veio a
-recomendação.
+## 4. Disponibilidade e Degradação
 
-### O sorteio sozinho não segura um pico
+O serviço adota resiliência Serverless nativa (AWS Lambda, S3, SQS e DynamoDB multi-AZ) e uma política de **degradação graciosa** (nunca falha com 503 se houver alternativa):
 
-Sortear espalha, mas não sabe quanto cabe. Cada request sorteia de forma independente, e a
-fatia que um pool recebe converge para a probabilidade de ele vencer, que não olha para o
-número de vagas dele. Dois mil jobs na mesma janela ainda cabem quase todos no mesmo pool,
-e o requisito não é responder rápido, é o job **conseguir** o pool.
+| Situação | Comportamento da API |
+|---|---|
+| Snapshot indisponível | Retorna último snapshot da RAM com `stale: true`. |
+| Snapshot expirado (>5 min) | Responde normalmente, emite métrica e dispara alarme CloudWatch. |
+| Nenhum snapshot existente | Retorna lista estática de `FALLBACK_POOLS` com `degraded: true`. |
+| Filtro sem correspondência | Retorna HTTP `404` explícito. |
+| Parâmetro inválido | Retorna HTTP `422` (validação Pydantic). |
+| Falha na API Databricks | Segue sem dados de capacidade (usa apenas histórico). |
 
-Por isso a fatia de cada candidato tem teto, derivado da capacidade livre que a Databricks
-reporta. A comparação é contra o candidato mais folgado, não contra a soma: comparar com a
-soma apertaria todo mundo só por existirem muitos pools, quando capacidade igual significa
-exatamente que nenhum é mais frágil que o outro.
+---
 
-| Situação | Teto | Efeito |
+## 5. Contrato da API (`GET /get-pools`)
+
+Desenvolvido em **Python 3.13** (Amazon Linux 2023, suporte no Lambda até jun/2029). Endpoint principal: `GET /get-pools` (com alias `/get-pool`).
+
+### Parâmetros de Query
+
+| Parâmetro | Tipo | Descrição |
 |---|---|---|
-| Candidatos com folga parecida | nenhum | Idêntico ao sorteio puro. |
-| Pool com 1/3 da folga do maior | 100% | Ainda pode levar todo o tráfego. |
-| Pool com 2 vagas contra 60 | 10% | Leva 10%, e o resto escorre para o próximo melhor. |
-| Pool sem teto declarado | nenhum | Sem saber as vagas, qualquer número seria invenção. |
+| `job_id` | string | Identificador do job para ativar histórico específico. |
+| `instance_types` | string | Tipos de instância permitidos (separados por vírgula). |
+| `family` | string | Prefixo da família (ex: `r6`). |
+| `profile` | string | Perfil (`memory`, `compute`, `general`, `storage`). |
+| `availability_zones` | string | AZs restritas para localidade de dados. |
+| `exclude_pools` | string | Pools a ignorar (para retry). |
+| `min_samples` | int | Amostras mínimas exigidas (desliga exploração). |
+| `strategy` | string | `sampling` (default) ou `greedy` (determinístico). |
+| `alternatives` | int | Qtd de alternativas de reserva (default: 2). |
+| `seed` | int | Semente aleatória para testes/reprodutibilidade. |
 
-A alocação é uma passada em ordem de score: o melhor leva o que couber no teto dele, o
-excedente vai para o seguinte. O sorteio é um número uniforme contra essa distribuição, e
-o custo continua sendo zero de I/O. `strategy=greedy` ignora o teto de propósito, porque
-quem pede resposta determinística quer o melhor pool e não uma distribuição.
-
-O que isso não resolve: se todos os candidatos estão quase cheios, todos têm folga parecida
-e ninguém é limitado. Rotear não cria capacidade, e esse caso pede pool novo. O sinal para
-perceber é o `free_slots` que vai na resposta.
-
-### Job novo erra, e se corrige em três execuções
-
-Um job que nunca rodou não começa cego. O fator de AZ já nasce calibrado, porque veio de
-todos os outros jobs. Falta só saber se ele precisa de máquina maior, dentro da família
-que o cliente já restringiu, e para isso o prior vem do perfil declarado: um job novo que
-pede `profile=memory` herda o comportamento médio dos outros jobs de memória.
-
-A correção é rápida porque falha é sinal forte e sucesso é sinal fraco. Partindo de 0,9,
-três falhas naquele tipo de instância derrubam o score para perto de 0,36. Job diário
-aprende em menos de uma semana.
-
-No lançamento nem isso acontece: o bucket já tem meses de evento, então dá para
-reprocessar o histórico e nascer com o modelo treinado para todos os jobs existentes.
-Cold start passa a valer só para job genuinamente novo.
-
----
-
-## 4. Disponibilidade e degradação
-
-Este serviço fica no caminho de submissão de job. Se ele falhar, trava pipeline de gente.
-Por isso a disponibilidade vem de duas frentes.
-
-A primeira é não ter nada próprio para cair. Lambda, S3, SQS e DynamoDB são gerenciados e
-já rodam replicados entre as AZs da região, sem configuração nenhuma. Não há instância
-para monitorar, não há load balancer, não há VPC, e o caminho de leitura quase nunca faz
-chamada de rede. Menos peça significa menos coisa que pode falhar.
-
-A segunda é o serviço nunca devolver erro se puder evitar:
-
-| Situação | Resposta |
-|---|---|
-| Snapshot indisponível | Serve o último que tem em memória, marca `stale: true`. |
-| Snapshot velho demais | Continua respondendo, emite métrica e dispara alarme. |
-| Nenhum snapshot | Lista estática de pools conhecidos, escolha uniforme, `degraded: true`. |
-| Filtro não casa com nada | 404 com mensagem explícita. |
-| Parâmetro inválido | 422, gerado pela validação. |
-| Token da Databricks ilegível | Segue sem a fonte de capacidade, registra o motivo no log. |
-
-O job vai ser submetido de qualquer jeito. Um palpite informado é melhor que um 503.
-
----
-
-## 5. Contrato do endpoint
-
-Python 3.13, acima do mínimo 3.9 pedido. É o runtime de Lambda com prazo de depreciação
-mais longo (junho de 2029) e roda em Amazon Linux 2023. Python 3.11 foi a primeira
-escolha e caiu na revisão: ainda vive em Amazon Linux 2, cujo fim de vida foi em junho de
-2026, e é depreciado no Lambda em junho de 2027.
-
-`GET /get-pools`, todos os parâmetros opcionais e combináveis. O enunciado cita os dois
-nomes, `/get-pool` no requisito do endpoint e `/get-pools` no do ambiente local, então o
-serviço responde nos dois: `/get-pools` é o documentado e `/get-pool` é alias. Localmente
-sobe em `http://localhost:5050`.
-
-| Parâmetro | Efeito |
-|---|---|
-| `job_id` | Ativa o histórico daquele job. Sem ele, só o fator de AZ é usado. |
-| `instance_types` | Lista explícita, ex. `r6.xlarge,r6.2xlarge`. |
-| `family` | Prefixo de família, ex. `r6`. |
-| `profile` | `memory`, `compute`, `general` ou `storage`. |
-| `availability_zones` | Restringe AZs, para jobs com localidade de dados. |
-| `exclude_pools` | Pools a ignorar, útil para retry. |
-| `min_samples` | Exige evidência mínima. Desliga a exploração para job crítico. |
-| `strategy` | `sampling` (padrão) ou `greedy`. |
-| `alternatives` | Quantos pools de reserva retornar, padrão 2. |
-| `seed` | Semente do sorteio. Existe para teste e depuração. |
+### Exemplo de Resposta JSON
 
 ```json
 {
@@ -379,298 +257,208 @@ sobe em `http://localhost:5050`.
 }
 ```
 
-Devolver alternativas é deliberado: quem perder instância no pool sugerido faz fallback
-sem uma segunda chamada. O campo `evidence.source` diz se a recomendação veio do
-histórico do job, do perfil, ou de nada, o que permite ao time saber quando é palpite. E
-`az_outlook` mostra a previsão da AWS para aquela AZ separada do histórico observado, com
-a capacidade alvo que gerou o número, porque score de placement sem a capacidade
-perguntada não quer dizer nada.
+### Códigos de Resposta HTTP
 
-A documentação interativa do endpoint é o OpenAPI gerado automaticamente pelo FastAPI,
-em `/docs`.
-
----
-
-## 6. Escolhas de ferramenta
-
-### 6.1 Framework web
-
-| Opção | Veredito |
-|---|---|
-| **FastAPI** (escolhida) | Os filtros de query são a parte chata desse endpoint, e o Pydantic resolve validação e mensagem de erro sem código manual. O OpenAPI vem de graça. Custo: o tempo de import pesa no cold start. |
-| Flask | Sem validação embutida. Eu escreveria à mão o parsing dos filtros e a documentação. |
-| Django REST | ORM e ciclo de vida que este serviço não usa. Import pesado demais para Lambda. |
-| Litestar | Boa, mas com ecossistema menor. A familiaridade do time vale mais que a diferença de benchmark, que some diante do custo de rede. |
-| Handler puro | Menor cold start possível, mas perde validação, documentação e a possibilidade de rodar local com Uvicorn. |
-
-### 6.2 Onde a API roda
-
-| Opção | Veredito |
-|---|---|
-| **Lambda** (escolhida) | Baseline baixo com picos imprevisíveis é onde serverless ganha. Vai de zero a centenas de execuções simultâneas em segundos e não cobra nas horas ociosas. Custo: cold start. |
-| ECS Fargate | Sem cold start, mas o autoscaling reage em 30 a 60 segundos e o pico acontece mais rápido. Piso de custo pago mesmo de madrugada. |
-| EC2 com Auto Scaling | Mesma limitação de reação, com patch de sistema operacional por cima. |
-| EKS | Só compensa se a empresa já roda tudo em Kubernetes e o serviço herdar deploy e observabilidade. Infra demais para um arquivo de poucos kilobytes. |
-
-### 6.3 Porta de entrada HTTP
-
-| Opção | Veredito |
-|---|---|
-| **Function URL** (escolhida) | Não cobra por request, e autenticação IAM basta para um serviço interno. Uma peça a menos. |
-| API Gateway HTTP API | Cobra por request e adiciona um salto. Vale se precisar de throttling por consumidor ou domínio próprio. É o próximo passo se o serviço for exposto para fora. |
-| ALB | Piso de custo por hora, cobrado o tempo todo, o que anula a vantagem de escalar a zero. |
-
-### 6.4 Banco de dados
-
-A escolha ficou em aberto, inclusive a de não usar banco. O escolhido é o **DynamoDB**,
-um NoSQL chave-valor, e ele guarda os contadores de eventos por pool e por minuto.
-
-Banco é necessário por dois motivos. Os contadores precisam sobreviver entre execuções de
-funções que não compartilham memória. E a entrega do SQS é at-least-once, então a mesma
-mensagem pode chegar duas vezes: sem escrita condicional por chave de evento, um lote
-reentregue contaria a mesma falha de novo e afundaria um pool que estava bem.
-
-Não é SQL porque não há nada relacional: sem join, sem transação entre entidades, sem
-query analítica no caminho quente. O acesso é sempre "me dá o contador desta chave" e
-"soma um neste contador".
-
-| Opção | Veredito |
-|---|---|
-| **DynamoDB** (escolhida) | Incremento atômico e escrita condicional, que são exatamente as operações da ingestão, e TTL nativo, que implementa a janela deslizante sem job de limpeza. Escala a zero. |
-| Nenhum banco, estado só no snapshot | O decaimento é incremental, então a agregadora poderia guardar o próprio estado no arquivo que já publica. Some uma peça, mas some também a deduplicação por evento, e um reprocessamento vira número errado. |
-| PostgreSQL (RDS) | Nada aqui é relacional. Custo fixo por hora e conexões que combinam mal com Lambda. |
-| Redis (ElastiCache) | Piso de custo fixo e vive em VPC, o que adiciona interface de rede ao cold start. |
-| Athena sobre o S3 | Cobrança por volume escaneado, e a agregadora roda 1.440 vezes ao dia. Continua sendo a ferramenta certa para análise offline. |
-
-### 6.5 Onde guardar o snapshot
-
-Decisão separada, porque o snapshot não é banco: é um arquivo reconstruído do zero a cada
-minuto, que pode ser perdido sem perda de dado. O padrão de acesso também é o oposto,
-escrito uma vez por minuto e lido por toda instância da API que sobe fria.
-
-| Opção | Veredito |
-|---|---|
-| **S3 com gzip** (escolhida) | Milhares de leituras por segundo por prefixo, e o gzip derruba o arquivo para poucos kilobytes. A latência é mais variável que a do DynamoDB, mas o cache de 30 segundos absorve isso. |
-| DynamoDB | Foi a primeira escolha e caiu na revisão de escala. O snapshot é um item só, logo uma partição só, e partição tem teto de leitura por segundo. Cold start em massa chega perto desse teto no pico. Ver [seção 7](#7-escala). |
-| Embutir no pacote de deploy | Leitura instantânea, mas exigiria um deploy por minuto. |
-
-### 6.6 Ferramentas de projeto
-
-| Decisão | Escolha | Por que não as outras |
+| Código | Condição | Significado |
 |---|---|---|
-| Dependências | **uv** | pip com requirements não trava dependências transitivas. Poetry resolve, mas é bem mais lento no CI. |
-| Ingestão dos eventos | **Notificação S3 e SQS** | Sem a fila não há DLQ nem controle de concorrência, e uma rajada de arquivos vira uma rajada de invocações. Kinesis seria certo se a origem fosse stream, mas a origem é arquivo. |
-| Agendamento | **EventBridge Scheduler** | Cron em container exigiria container ligado o tempo todo. Airflow é peça grande demais para um job de um minuto. |
-| Infra como código | **Terraform** | SAM só descreve serverless, e a infra aqui tem fila, tabela, agendamento e alarme. CDK exigiria infra em outra linguagem. |
-| CI/CD | **GitHub Actions com OIDC** | GitLab CI e CircleCI são equivalentes; segue onde o repositório vive. O ponto não negociável é OIDC em vez de chave estática. |
-| Testes | **pytest, Hypothesis, moto** | Só teste de exemplo não cobre bem um componente estatístico, daí as propriedades. LocalStack fica para o ambiente de dev; nos testes, moto é mais rápido. |
-| Qualidade | **ruff e mypy** | Black, flake8 e isort fazem o mesmo em três ferramentas e mais devagar. Tipagem estrita só no domínio, onde tem valor. |
+| **200 OK** | Sucesso | Pool recomendado com evidência (pode ter `stale: true`). |
+| **200 OK** | Fallback ativado | Respondido via lista estática de fallback (`degraded: true`). |
+| **404 Not Found** | Filtro sem resultado | Nenhum pool atende aos critérios informados. |
+| **422 Unprocessable Entity** | Erro de parâmetro | Erro de validação gerado pelo FastAPI/Pydantic. |
+| **503 Service Unavailable** | Sem dados e sem fallback | Snapshot indisponível e `FALLBACK_POOLS` nã## 6. Escolhas de Ferramentas e Infraestrutura
+
+### 6.1 Framework Web & Execução
+
+| Camada | Escolha | Motivo | Alternativas Descartadas |
+|---|---|---|---|
+| **Framework** | **FastAPI** | Validação Pydantic e OpenAPI automático | Flask (sem validação), Django (pesado), Handler puro (sem docs/rotas) |
+| **Computação** | **AWS Lambda** | Escala a zero, sem custo ocioso e escala instantânea | Fargate/EC2 (custo fixo + autoscaling lento), EKS (complexidade excessiva) |
+| **Entrada HTTP** | **Function URL** | Zero custo por request, autenticação via IAM | API Gateway (cobrança por req), ALB (custo fixo por hora) |
+
+### 6.2 Armazenamento & Banco de Dados
+
+| Componente | Escolha | Motivo | Alternativas Descartadas |
+|---|---|---|---|
+| **Contadores de Eventos** | **DynamoDB** | Escrita condicional (deduplicação SQS), incremento atômico e TTL nativo | PostgreSQL/Redis (custo fixo, conexões em Lambda), Athena (lento para escrita) |
+| **Snapshot de Ranking** | **S3 + Gzip** | Leitura massiva paralela, cache de RAM de 30s absorve latência | DynamoDB (teto de IOPS em partição única durante cold start) |
+
+### 6.3 Tooling & Projeto
+
+* **Gerenciador de Dependências:** `uv` (rápido, trava dependências transitivas).
+* **Agendamento:** `EventBridge Scheduler` (disparo Serverless a cada 1 min).
+* **IaC & CI/CD:** `Terraform` (gerencia IAM, SQS, S3, Lambdas) + `GitHub Actions` com `OIDC` (sem keys estáticas).
+* **Qualidade & Testes:** `pytest`, `Hypothesis` (baseado em propriedades), `moto` (mock AWS), `ruff` e `mypy`.
 
 ---
 
-## 7. Escala
+## 7. Escala e Capacidade
 
-O volume que este serviço vê não é o volume de dados da empresa. Um job que processa dez
-terabytes gera um evento. O que importa é quantos jobs terminam por dia.
+O gargalo do sistema não é volume de dados, mas **concorrência de leitura no pico** (ex: 2.000 jobs iniciando juntos).
 
-Cinquenta mil jobs por dia dão 0,6 evento por segundo. Mesmo com dois mil jobs terminando
-no mesmo minuto, são 33 por segundo, que uma fila SQS nem registra. O eixo de risco não é
-volume de dados, é concorrência de leitura no pico.
+### Cenário de Referência: 2.000 Jobs Simultâneos
 
-Cenário de referência: dois mil jobs disparados no mesmo instante.
-
-| Componente | Carga | Situação |
+| Componente | Carga Estimada | Status de Resiliência |
 |---|---|---|
-| Lambda da API | 2.000 req/s a 5 ms dão cerca de 10 execuções simultâneas | Folga enorme. É o caminho sem I/O que faz essa conta ser trivial. |
-| Fila e ingestão | 33 eventos por segundo | Irrelevante. |
-| Escrita dos contadores | Poucas escritas por lote, com pré-agregação | Segura. Sem pré-agregação, o ingestor vira o gargalo. |
-| Leitura do snapshot | Até 2.000 leituras do mesmo arquivo, vindas de cold start | Era aqui que quebrava. Resolvido com S3 e gzip. |
-| Agregadora | Independe do tráfego | Segura, depois de virar incremental. |
-| Chamadas às fontes externas | 1 por minuto na Databricks, 1 a cada 5 minutos por perfil na AWS | Constantes, e nenhuma delas cresce com o número de jobs. |
+| **Lambda API** | 2.000 req/s @ 5ms (~10 instâncias concorrentes) | Seguro (sem I/O no request) |
+| **Fila SQS & Ingestor** | 33 eventos/s (50k jobs/dia) | Seguro (processamento em batch) |
+| **Leitura do Snapshot** | 2.000 leituras simultâneas | Seguro (cache RAM 30s + S3 gzip) |
+| **Fontes Externas** | 1 req/min (Databricks), 1 req/5min (AWS SPS) | Fixo (independe do volume de jobs) |
 
-### Duas mudanças que a escala exige
+### Otimizações de Escala Aplicadas
 
-Pré-agregação no ingestor: o SQS entrega em lote, e somar as mensagens em memória antes
-de escrever transforma milhares de escritas em poucas, uma por par de pool e minuto.
-
-Agregadora incremental: ler a janela de seis horas a cada minuto significa, com trezentos
-pools, cerca de cento e oito mil itens por execução, 1.440 vezes ao dia. Decaimento
-exponencial é incremental por natureza, então
-`novo = anterior × decaimento + delta do último minuto` transforma isso em O(1).
-
-### Antes do primeiro pico
-
-- Solicitar aumento da cota de concorrência do Lambda e validar com teste de carga. O
-  limite padrão barra pico súbito por cota, não por capacidade técnica.
-- Conferir o modo do DynamoDB. Sob demanda dobra a capacidade conforme cresce, mas barra
-  pico bem acima do anterior. Para pico no mesmo horário todo dia, o certo é capacidade
-  provisionada com auto scaling agendado.
-- Medir o cold start de verdade, com o pacote final.
-- Conferir o limite de capacidade alvo do placement score. Ele é calculado a partir do
-  uso recente de spot da conta, então uma conta com pouco histórico recebe um limite baixo
-  por padrão e o número volta rebaixado sem erro nenhum. Vale validar contra o uso real
-  antes de confiar no sinal.
-- Alarme na idade do snapshot e na taxa de resposta degradada, que são os sinais que
-  aparecem antes de o usuário perceber.
+1. **Pré-agregação no Ingestor:** SQS consome em lote e consolida contadores em RAM antes de atualizar o DynamoDB.
+2. **Agregadora Incremental O(1):** `novo = anterior × decaimento + delta`. Evita reprocessar todo o histórico.
 
 ---
 
-## 8. Custo
+## 8. Custo Estimado (~1,5M requests/mês)
 
-Ordem de grandeza para 1,5 milhão de requests por mês. Os valores mudam por região e ao
-longo do tempo; a diferença entre os desenhos, não.
-
-| Item | Escolhido | Se fosse container |
+| Item | Arquitetura Atual (Serverless) | Alternativa Tradicional (Containers + ALB) |
 |---|---|---|
-| Computação da API | menos de US$ 1 | a partir de US$ 15 |
-| Porta de entrada | US$ 0 | cerca de US$ 16 de ALB |
-| Ingestão, agregação e armazenamento | cerca de US$ 1 | cerca de US$ 1 |
-| Logs e métricas | US$ 2 a US$ 5 | US$ 2 a US$ 5 |
-| **Total** | **abaixo de US$ 10** | **acima de US$ 35, pago sem tráfego** |
-
-O valor importa menos que o formato da curva: o custo do cálculo é fixo, sempre uma
-execução por minuto. Se o número de jobs multiplicar por cem, a arquitetura não muda.
+| Computação API | < US$ 1,00 | > US$ 15,00 |
+| Entrada HTTP | US$ 0,00 (Function URL) | ~US$ 16,00 (ALB) |
+| Ingestão, Agregação & S3 | ~US$ 1,00 | ~US$ 1,00 |
+| CloudWatch Logs & Métricas | US$ 2,00 - US$ 5,00 | US$ 2,00 - US$ 5,00 |
+| **TOTAL MENSAL** | **< US$ 10,00** | **> US$ 35,00 (paga sem uso)** |
 
 ---
 
-## 9. O que foi construído
-
-O miolo estatístico é Python puro, sem `boto3` e sem FastAPI, então roda em teste em
-milissegundos sem simular AWS. As bordas ficam finas o bastante para poucos testes de
-integração.
+## 9. Estrutura do Código
 
 ```
 src/pool_selection/
-├── domain/              # Python puro, sem AWS
-│   ├── pool.py          # parse de pool-r6.xlarge-us-east-1c
-│   ├── events.py        # classificação de status e reason
-│   ├── scoring.py       # os dois fatores e o decaimento
-│   ├── selection.py     # o sorteio
-│   └── filters.py       # família, perfil, AZ, exclusões
-├── ports/               # interfaces com o mundo externo
-├── adapters/            # dynamodb, s3, memória
-└── entrypoints/
-    ├── api/             # app FastAPI
-    ├── ingestor/        # consome a fila
-    └── aggregator/      # gera o snapshot
+├── domain/                  # Python puro, sem dependência de AWS
+│   ├── pool.py              # Vocabulário: PoolId, InstanceType, AvailabilityZone, Profile
+│   ├── events.py            # Classificação de eventos (SUCCESS → +1, SPOT_TERMINATION → -1)
+│   ├── catalog.py           # Classificação de perfil por razão memória/vCPU
+│   ├── statistics.py        # Distribuição Beta pura em Python (sem scipy, ~80 linhas)
+│   ├── scoring.py           # Fatores, Evidence com decaimento, Capacity, PlacementForecast
+│   ├── snapshot.py          # Snapshot completo (pools + job_fit + profile_fit + catalog)
+│   ├── filters.py           # Filtros do cliente (instance_types, family, profile, AZs)
+│   └── selection.py         # Thompson Sampling, Capacity Caps, Allocate, Draw
+│
+├── ports/                   # Interfaces (contratos abstratos)
+│   ├── counters.py          # Interface do store de contadores
+│   ├── snapshots.py         # Interface do store de snapshots
+│   └── sources.py           # Interface das fontes externas (Databricks, EC2)
+│
+├── adapters/                # Implementações concretas (AWS, Databricks)
+│   ├── s3_snapshots.py      # Lê/escreve snapshot no S3
+│   ├── file_snapshots.py    # Lê snapshot de arquivo local (dev)
+│   ├── dynamodb_counters.py # Lê/escreve contadores no DynamoDB
+│   ├── ec2_placement.py     # Consulta Spot Placement Score da AWS
+│   ├── ec2_catalog.py       # Consulta DescribeInstanceTypes da AWS
+│   ├── databricks_pools.py  # Consulta API de pools do Databricks
+│   ├── secrets.py           # Lê token do Secrets Manager
+│   └── memory.py            # Implementação em memória (testes)
+│
+├── entrypoints/             # Pontos de entrada (Lambda handlers)
+│   ├── api/
+│   │   ├── handler.py       # Mangum (adapta Lambda → FastAPI)
+│   │   ├── app.py           # FastAPI app, rotas /get-pools e /get-pool
+│   │   ├── schemas.py       # Pydantic schemas (PoolRecommendation, Evidence, etc.)
+│   │   └── snapshot_cache.py # Cache em memória com TTL de 30s
+│   ├── ingestor/
+│   │   └── handler.py       # Consome SQS, classifica eventos, atualiza DynamoDB
+│   └── aggregator/
+│       └── handler.py       # Combina DynamoDB + Databricks + EC2, publica snapshot
+│
+├── config.py                # Settings via variáveis de ambiente
+└── observability.py         # Logging estruturado e métricas CloudWatch
 
-infra/                   # Terraform
-tools/gen_events.py      # gerador de eventos sintéticos
-tests/                   # unit, propriedades, integração, simulação
-```
+infra/                       # Terraform
+├── versions.tf              # Provider AWS, backend S3
+├── variables.tf             # 14 variáveis configuráveis
+├── storage.tf               # 2 buckets S3 + tabela DynamoDB
+├── queue.tf                 # Fila SQS + DLQ + notificação S3→SQS
+├── iam.tf                   # 4 IAM Roles (menor privilégio)
+├── lambda.tf                # 3 Lambdas + EventBridge Scheduler
+├── monitoring.tf            # 6 alarmes CloudWatch + 1 dashboard
+├── outputs.tf               # URLs e ARNs expostos
+└── envs/                    # staging.tfvars / production.tfvars
 
-| Fase | O que entra |
-|---|---|
-| 1. Domínio | Classificação, decaimento, os dois fatores, o prior de placement score, sorteio e filtros, com testes de propriedade. Sem uma linha de AWS. |
-| 2. API | `/get-pool` com todos os filtros, degradação, `/health`, `/ready` e OpenAPI, contra repositório em memória. |
-| 3. Ambiente local | Adapters, docker compose com LocalStack, gerador de eventos e o Makefile. |
-| 4. Pipeline | Ingestora com pré-agregação e deduplicação, agregadora incremental, as três fontes ligadas, e o teste que derruba a disponibilidade de uma AZ e verifica que a recomendação migra antes de o primeiro job morrer. |
-| 5. Produção | Terraform, GitHub Actions, alarmes e backfill do histórico. As decisões arquiteturais estão neste documento, com as alternativas descartadas em cada uma; não há um diretório de ADRs separado. |
-| 6. Depois | Penalização por concentração. Fora do escopo mínimo, precisa de tráfego real para calibrar. |
-
-Ambiente de desenvolvimento: `make dev` faz o `uv sync` criar o ambiente virtual, roda o
-pipeline de verdade em memória sobre eventos sintéticos, grava o snapshot num arquivo e
-liga a API com reload em `http://localhost:5050`. Sem Docker: o único pré-requisito é o
-`uv`, que instala o próprio Python.
-
-O que muda no modo local é de onde se lê e onde se grava, nunca o que roda no meio. A
-ingestora e a agregadora são as mesmas, e o arquivo gerado é byte a byte o que a produção
-publicaria. `make dev-aws` roda o mesmo fluxo contra o LocalStack, para exercitar os
-adapters de AWS, e `docker compose up` sobe tudo em container para quem não quer nem o
-`uv` na máquina.
+tools/gen_events.py          # Gerador de eventos sintéticos
+tests/                       # unit, propriedades, contrato, integração, simulação, carga
+* **Desenvolvimento Local:** Pode ser executado em **1 comando** via **Docker** (`docker compose up` ou `make demo`) ou nativamente via **uv** (`make dev`). Para simulação de serviços AWS completos (LocalStack), utilize `make dev-aws`.
 
 ---
 
-## 10. CI/CD e testes
+## 10. CI/CD e Qualidade
 
-### Testes
+### Estratégia de Testes
 
-O domínio é Python puro, então a maior parte da suíte roda em milissegundos, sem simular
-AWS nenhuma.
-
-| Nível | O que cobre | Com o quê |
+| Nível | Escopo | Ferramenta |
 |---|---|---|
-| Unitário | Classificação de evento, decaimento, os dois fatores, sorteio e filtros. | pytest |
-| Propriedade | Invariantes que exemplo não pega: score sempre entre 0 e 1, filtro nunca devolve pool fora do filtro, pool só com término de spot nunca vence pool bom com amostra grande, para qualquer semente. | Hypothesis |
-| Integração | Adapters de DynamoDB e S3 contra AWS simulada em processo, incluindo reentrega de lote para provar a deduplicação. | moto |
-| Contrato | O endpoint inteiro, incluindo validação de parâmetro e formato da resposta. | TestClient |
-| Simulação | Muda a disponibilidade de uma AZ no meio do fluxo e verifica que a recomendação migra dentro do prazo esperado. É o único teste que prova que o algoritmo funciona. | pytest |
-| Carga | Pico de dois mil requests simultâneos, para validar p99 e a cota de concorrência antes de descobrir em produção. | k6 |
+| **Unitário** | Decaimento, Thompson Sampling, Filtros | `pytest` |
+| **Propriedade** | Invariantes (scores entre 0 e 1, filtros estritos) | `Hypothesis` |
+| **Integração** | DynamoDB, S3, deduplicação de batch SQS | `moto` |
+| **Contrato** | Endpoint HTTP e esquemas JSON | `TestClient` |
+| **Simulação** | Migração de recomendação após queda de AZ | `pytest` |
+| **Carga** | Validação de concorrência e p99 | `k6` |
 
-Gate de cobertura em 85%, medido no domínio, que é onde cobertura significa alguma coisa.
+* **Gate de Cobertura:** Mínimo de 85% no código de domínio.
 
-### Pipeline
+### Deploy Canary Automatizado
 
-| Momento | O que roda |
-|---|---|
-| Em todo PR | ruff para lint e formatação, mypy no domínio, pytest com cobertura, pip-audit para vulnerabilidade de dependência, build do artefato e `terraform plan`. |
-| No merge para main | Deploy automático em staging, com o teste de simulação rodando contra o ambiente de verdade. |
-| Produção | Aprovação manual, depois `terraform apply` e publicação da Lambda. |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Dev as Desenvolvedor
+    participant GH as GitHub Actions
+    participant AWS as AWS Cloud
 
-O deploy usa alias versionado com shift gradual, 10% do tráfego primeiro e 100% depois,
-com rollback automático disparado por alarme de erro. Como o serviço está no caminho de
-submissão de job, um deploy ruim não pode virar incidente enquanto alguém percebe.
+    Dev->>GH: git push main
+    GH->>GH: make package
 
-A autenticação com a AWS é por OIDC. O GitHub Actions assume uma role por confiança
-federada, e nenhuma chave de acesso fica guardada no repositório.
+    rect rgb(45, 80, 120)
+    Note over GH,AWS: Staging
+    GH->>AWS: terraform apply - staging
+    GH->>AWS: Smoke test na API real
+    end
+
+    rect rgb(80, 45, 45)
+    Note over GH,AWS: Producao - requer aprovacao
+    GH->>AWS: terraform apply - production
+    GH->>AWS: Publica nova versao da Lambda
+    GH->>AWS: Direciona 10% para nova versao
+    GH->>GH: Espera 5 minutos monitorando alarmes
+    alt Alarme disparou
+        GH->>AWS: Rollback - 100% na versao anterior
+    else Tudo verde
+        GH->>AWS: Promove para 100%
+    end
+    end
+```
 
 ---
 
 ## 11. Observabilidade
 
-Log estruturado em JSON e métricas via Embedded Metric Format, que não gasta chamada de
-API por métrica.
+Métricas publicadas via **CloudWatch EMF (Embedded Metric Format)** sem custo extra de chamadas de API:
 
-| Métrica | Para quê |
-|---|---|
-| Latência p50 e p99 | Verificar se o caminho sem I/O está mesmo sem I/O. |
-| Idade do snapshot | Detectar agregadora parada antes de a recomendação apodrecer. |
-| Taxa de resposta degradada | Saber quando o serviço está no fallback. |
-| Distribuição dos pools recomendados | Detectar efeito manada. Sai como dimensão `Pool`, então o painel quebra por pool em vez de mostrar só o total. |
-| Origem da recomendação | Quanto do tráfego está sendo atendido por palpite. Vai como propriedade `source` no log estruturado. |
-| Agregadora sem invocação | Agregadora parada não gera erro, só para de rodar. É o único alarme que não depende de tráfego. |
-| Divergência entre placement score e falha observada | AZ com score alto onde jobs continuam morrendo significa que o peso da previsão está errado, ou que a capacidade alvo perguntada não representa o uso real. É o alarme que valida o sinal preditivo. |
+* **Latência:** p50 e p99 da API.
+* **Saúde da Agregadora:** Alarme disparado se a idade do snapshot exceder 5 minutos.
+* **Taxa de Fallback:** Percentual de respostas servidas em modo degradado (`degraded: true`).
+* **Distribuição de Pools:** Métrica com dimensão `Pool` para monitorar efeito manada.
+* **Acurácia Preditiva:** Divergência entre Spot Placement Score da AWS e falhas reais observadas.
 
 ---
 
-## 12. Limites conhecidos
+## 12. Limitações Conhecidas
 
-Efeito manada em pico é a limitação mais séria, e é de modelo, não de infra. O teto por
-capacidade da [seção 3](#o-sorteio-sozinho-não-segura-um-pico) cobre a parte que dá para
-cobrir sem estado compartilhado: nenhum pool recebe fatia maior do que a folga dele
-comporta. O que ele não cobre é a demanda real, porque a API não sabe quantos jobs estão
-chegando. O teto limita a proporção, não o número absoluto.
-
-Fechar isso exige contar quantas recomendações cada pool recebeu nos últimos minutos, o
-que significa escrita no caminho de request, ainda que assíncrona. Fica para quando houver
-tráfego real para calibrar, e o sinal que diz se é necessário é a distribuição por pool no
-painel.
-
-As outras:
-
-- A previsão não desce até o pool. O placement score exige três tipos de instância para
-  valer alguma coisa, então ele fala sobre a AZ e o perfil, nunca sobre `r6.xlarge` em
-  `us-east-1c` especificamente. Dentro de uma AZ apertada, distinguir qual dos pools
-  aguenta continua sendo trabalho do histórico.
-- O evento não diz quantas instâncias um job usou. A API da Databricks dá a capacidade do
-  pool, mas não o apetite do job, então "este job cabe neste pool" continua sendo
-  inferido pelo histórico dele, não calculado. É também o que obriga a capacidade alvo do
-  placement score a ser estimada por perfil, em vez de pedida por job.
-- Job que nunca rodou em lugar nenhum só tem o prior do perfil. Vai errar às vezes.
-- O serviço recomenda, mas não sabe se foi obedecido. A métrica que mede o valor dele é
-  comparar a taxa de término de spot dos jobs que seguiram a recomendação com a linha de
-  base histórica, e esses dados já chegam no mesmo bucket.
+1. **Efeito Manada em Picos Extremos:** O teto de capacidade limita a proporção de tráfego enviada a cada pool, mas não controla o volume total absoluto de jobs simultâneos no mesmo segundo (exige escrita assíncrona no request para balanço global).
+2. **Granularidade do Placement Score:** O Spot Placement Score exige pelo menos 3 tipos de máquina por consulta; logo, mede a disponibilidade da AZ/Perfil, cabendo ao histórico diferenciar os pools específicos dentro daquela AZ.
+3. **Falta de Métricas de Recursos por Job:** O evento indica o término do job, mas não a quantidade exata de executores/memória exigidos; o ajuste de capacidade é feito dinamicamente por histórico e perfil.
 
 ---
 
 ## Glossário
 
-| Termo | O que é |
+| Termo | Conceito |
 |---|---|
-| Function URL | Uma URL HTTPS colada direto numa Lambda, sem cobrança por request. |
-| TTL | Campo com data de validade. O banco apaga o item sozinho, o que implementa a janela deslizante sem job de limpeza. |
-| Partição | O DynamoDB divide os dados por chave, e cada fatia tem teto próprio de leitura por segundo. Uma chave muito requisitada concentra tudo em uma partição e chega nesse teto. |
-| Cold start | A primeira execução de uma Lambda parada há um tempo precisa subir o runtime e importar as bibliotecas, o que custa algumas centenas de milissegundos. |
-| At-least-once | O SQS garante que a mensagem chega, não que chega uma vez só. Quem consome precisa aguentar receber a mesma duas vezes. |
-| Thompson Sampling | Em vez de sempre escolher o melhor conhecido, sorteia dentro da faixa de incerteza de cada opção. Quem tem pouca evidência às vezes ganha, e assim gera evidência. |
-| OIDC no CI | O GitHub Actions assume uma role da AWS por confiança federada, sem chave de acesso no repositório. |
+| **Function URL** | Endpoint HTTPS direto na AWS Lambda sem custo de API Gateway. |
+| **TTL (Time-To-Live)** | Expiração automática de itens no DynamoDB para janela deslizante sem cron jobs. |
+| **Thompson Sampling** | Algoritmo bandit Bayesian que equilibra exploração (aprender pools novos) e exploração (usar os melhores). |
+| **At-least-once** | Garantia de entrega do SQS onde mensagens podem ser duplicadas, exigindo deduplicação atômica no banco. |
+| **OIDC no CI** | Autenticação federada entre GitHub Actions e AWS sem chaves estáticas de acesso. |
+| **Cold Start** | Primeira execução da Lambda parada, que inicializa o runtime e módulos em RAM. |

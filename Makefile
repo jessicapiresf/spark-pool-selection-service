@@ -72,7 +72,16 @@ test-fast:  ## So o dominio e a API, sem simular AWS. Roda em milissegundos.
 	$(RUN) pytest tests/unit tests/properties tests/contract -q --no-cov
 
 load:  ## Pico de 2.000 requests simultaneos contra a API local
-	k6 run tests/load/get_pool.js
+	@if command -v k6 >/dev/null 2>&1; then \
+		k6 run tests/load/get_pool.js; \
+	elif command -v docker >/dev/null 2>&1; then \
+		echo "k6 nao encontrado localmente. Executando via Docker..."; \
+		docker run --rm -i --network=host grafana/k6 run - < tests/load/get_pool.js; \
+	else \
+		echo "Erro: k6 ou Docker sao necessarios para rodar o teste de carga."; \
+		echo "Instale o k6 (https://k6.io/docs/getting-started/installation/) ou Docker."; \
+		exit 1; \
+	fi
 
 package:  ## Monta o zip de deploy com as dependencias de producao
 	rm -rf dist/build dist/pool_selection.zip
